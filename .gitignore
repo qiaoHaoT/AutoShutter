@@ -28,3 +28,7 @@ Package.resolved
 
 # macOS
 .DS_Store
+
+# JetBrains (IntelliJ IDEA / AppCode)
+.idea/
+*.iml
