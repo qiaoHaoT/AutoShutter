@@ -132,20 +132,27 @@ final class CameraManager: NSObject, ObservableObject,
     /// 选择最佳摄像头：优先使用「虚拟多镜头设备」。
     /// 虚拟设备会在变焦时自动切换物理镜头（长焦/超广角），
     /// 并启用系统多帧合成处理，画质显著优于单颗广角镜头 + 数字变焦。
-    /// （仅调用 AVCaptureDevice.default 静态 API，线程安全，允许后台队列调用）
+    /// （仅调用 AVCaptureDevice.DiscoverySession 静态 API，线程安全，允许后台队列调用）
     nonisolated private func bestCamera(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
-        let types: [AVCaptureDevice.DeviceType] = [
-            .builtInTripleCamera,   // 三镜头（广角+超广角+长焦）
-            .builtInDualWideCamera, // 双镜头（广角+超广角）
-            .builtInDualCamera,     // 双镜头（广角+长焦）
-            .builtInWideAngleCamera // 单广角（兜底）
+        let preferredTypes: [AVCaptureDevice.DeviceType] = [
+            .builtInTripleCamera,      // 三镜头（广角+超广角+长焦）
+            .builtInDualWideCamera,    // 双镜头（广角+超广角）
+            .builtInDualCamera,        // 双镜头（广角+长焦）
+            .builtInWideAngleCamera    // 单广角（兜底）
         ]
-        for type in types {
-            if let device = AVCaptureDevice.default(type, for: .video, position: position) {
+        let discoverySession = AVCaptureDevice.DiscoverySession(
+            deviceTypes: preferredTypes,
+            mediaType: .video,
+            position: position
+        )
+        let devices = discoverySession.devices
+        // 优先选择包含最多物理镜头的虚拟设备
+        for type in preferredTypes {
+            if let device = devices.first(where: { $0.deviceType == type }) {
                 return device
             }
         }
-        return nil
+        return devices.first
     }
 
     /// 在后台队列中配置 AVCaptureSession
@@ -198,6 +205,10 @@ final class CameraManager: NSObject, ObservableObject,
                 self.configureDeviceDefaults()
                 self.session.startRunning()
                 self.isSessionRunning = self.session.isRunning
+                // 调试：打印实际使用的设备信息
+                print("[Camera] 使用设备: \(camera.deviceType.rawValue), " +
+                      "镜头: \(camera.localizedName), " +
+                      "zoom范围: \(String(format: "%.2f", camera.minAvailableVideoZoomFactor))x ~ \(String(format: "%.2f", camera.maxAvailableVideoZoomFactor))x")
             }
         }
     }
@@ -343,6 +354,9 @@ final class CameraManager: NSObject, ObservableObject,
                 camera.videoZoomFactor = clamped
                 Task { @MainActor in self.currentZoom = clamped }
                 camera.unlockForConfiguration()
+                print("[Camera] 变焦设置为 \(String(format: "%.2f", clamped))x, " +
+                      "设备: \(camera.localizedName), " +
+                      "支持最大变焦: \(String(format: "%.2f", camera.maxAvailableVideoZoomFactor))x")
             } catch {
                 print("设置变焦失败：\(error)")
             }
@@ -391,8 +405,14 @@ final class CameraManager: NSObject, ObservableObject,
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
-        // 默认编码：支持的 iPhone 上 AVCapturePhotoSettings 默认即 HEIF
-        let settings = AVCapturePhotoSettings()
+
+        // 显式使用 HEIF/HEVC 编码（如果设备支持），否则回退到 JPEG
+        let settings: AVCapturePhotoSettings
+        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+        } else {
+            settings = AVCapturePhotoSettings()
+        }
         settings.isHighResolutionPhotoEnabled = true
         // 最高画质优先：触发系统多帧合成与更深的图像处理管线
         if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.quality.rawValue {
