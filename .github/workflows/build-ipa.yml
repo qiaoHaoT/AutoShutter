@@ -1,0 +1,56 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1 | xargs -I{} sudo xcode-select -s {}/Contents/Developer
+          xcodebuild -version
+          echo "---"
+          xcodebuild -showsdks | grep -i ios
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build archive (unsigned)
+        run: |
+          xcodebuild archive \
+            -project AutoShutter.xcodeproj \
+            -scheme AutoShutter \
+            -archivePath build/AutoShutter.xcarchive \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            IPHONEOS_DEPLOYMENT_TARGET=17.0
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r build/AutoShutter.xcarchive/Products/Applications/AutoShutter.app build/Payload/
+          cd build
+          zip -r AutoShutter-unsigned.ipa Payload/
+          ls -lh AutoShutter-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoShutter-IPA
+          path: build/AutoShutter-unsigned.ipa
+          retention-days: 30
