@@ -561,7 +561,8 @@ final class CameraManager: NSObject, ObservableObject,
     deinit {
         captureTimer?.invalidate()
         recordTimer?.invalidate()
-        UIApplication.shared.isIdleTimerDisabled = false
+        // 注意：不在此处访问 UIApplication（deinit 非 MainActor 隔离，
+        // 常亮状态已在 stopAutoCapture() 中恢复）
         if session.isRunning {
             session.stopRunning()
         }

@@ -105,9 +105,9 @@ final class PreviewUIView: UIView {
         case .began:
             onPanBegan?(location)
         case .changed:
-            onPanChanged?(location, translation)
+            onPanChanged?(location, CGSize(width: translation.x, height: translation.y))
         case .ended, .cancelled:
-            onPanEnded?(translation)
+            onPanEnded?(CGSize(width: translation.x, height: translation.y))
         default:
             break
         }
