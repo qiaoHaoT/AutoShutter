@@ -129,29 +129,47 @@ final class CameraManager: NSObject, ObservableObject,
 
     // MARK: - 摄像头选择
 
-    /// 选择最佳摄像头：优先使用「虚拟多镜头设备」。
-    /// 虚拟设备会在变焦时自动切换物理镜头（长焦/超广角），
-    /// 并启用系统多帧合成处理，画质显著优于单颗广角镜头 + 数字变焦。
-    /// （仅调用 AVCaptureDevice.DiscoverySession 静态 API，线程安全，允许后台队列调用）
-    nonisolated private func bestCamera(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
-        let preferredTypes: [AVCaptureDevice.DeviceType] = [
-            .builtInTripleCamera,      // 三镜头（广角+超广角+长焦）
-            .builtInDualWideCamera,    // 双镜头（广角+超广角）
-            .builtInDualCamera,        // 双镜头（广角+长焦）
-            .builtInWideAngleCamera    // 单广角（兜底）
+    /// 根据变焦倍数和目标位置选择最合适的物理摄像头。
+    /// iPhone 16 Pro 上：zoom >= 3.0x 优先使用长焦镜头，否则使用广角。
+    /// 线程安全，允许后台队列调用。
+    nonisolated private func bestCamera(for position: AVCaptureDevice.Position, zoom: CGFloat = 1.0) -> AVCaptureDevice? {
+        let allTypes: [AVCaptureDevice.DeviceType] = [
+            .builtInTripleCamera,
+            .builtInDualWideCamera,
+            .builtInDualCamera,
+            .builtInTelephotoCamera,
+            .builtInWideAngleCamera,
+            .builtInUltraWideCamera
         ]
         let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: preferredTypes,
+            deviceTypes: allTypes,
             mediaType: .video,
             position: position
         )
         let devices = discoverySession.devices
-        // 优先选择包含最多物理镜头的虚拟设备
-        for type in preferredTypes {
-            if let device = devices.first(where: { $0.deviceType == type }) {
-                return device
+        print("[Camera] 可用设备列表:")
+        for device in devices {
+            print("  - \(device.deviceType.rawValue): \(device.localizedName), zoom: \(String(format: "%.2f", device.minAvailableVideoZoomFactor))x ~ \(String(format: "%.2f", device.maxAvailableVideoZoomFactor))x")
+        }
+
+        // 长焦镜头选择（zoom >= 3.0x 时优先）
+        if zoom >= 3.0 {
+            if let telephoto = devices.first(where: { $0.deviceType == .builtInTelephotoCamera }) {
+                print("[Camera] 选择长焦镜头: \(telephoto.localizedName)")
+                return telephoto
+            }
+            if let triple = devices.first(where: { $0.deviceType == .builtInTripleCamera }) {
+                print("[Camera] 选择三镜头虚拟设备: \(triple.localizedName)")
+                return triple
             }
         }
+
+        // 默认使用广角镜头（1x 主摄）
+        if let wide = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) {
+            print("[Camera] 选择广角镜头: \(wide.localizedName)")
+            return wide
+        }
+
         return devices.first
     }
 
@@ -162,8 +180,9 @@ final class CameraManager: NSObject, ObservableObject,
             self.session.beginConfiguration()
             self.session.sessionPreset = .photo
 
-            // 1. 选择后置摄像头（优先虚拟多镜头设备）
-            guard let camera = self.bestCamera(for: .back) else {
+            // 1. 选择后置摄像头（根据当前变焦倍数选择合适镜头）
+            let targetZoom = self.currentZoom > 1.0 ? self.currentZoom : 1.0
+            guard let camera = self.bestCamera(for: .back, zoom: targetZoom) else {
                 Task { @MainActor in self.errorMessage = "未找到后置摄像头。" }
                 self.session.commitConfiguration()
                 return
@@ -257,7 +276,8 @@ final class CameraManager: NSObject, ObservableObject,
     func switchCamera() {
         guard let currentInput = videoInput else { return }
         let targetPosition: AVCaptureDevice.Position = isUsingFrontCamera ? .back : .front
-        guard let newCamera = bestCamera(for: targetPosition) else {
+        let targetZoom = currentZoom > 1.0 ? currentZoom : 1.0
+        guard let newCamera = bestCamera(for: targetPosition, zoom: targetZoom) else {
             return
         }
 
@@ -343,9 +363,22 @@ final class CameraManager: NSObject, ObservableObject,
 
     // MARK: - 变焦控制
 
-    /// 设置变焦倍数
+    /// 设置变焦倍数。当目标 zoom 跨越物理镜头阈值（3.0x）时，自动切换镜头。
     func setZoom(_ zoom: CGFloat) {
         guard let camera = currentCamera else { return }
+
+        let needsTelephoto = zoom >= 3.0
+        let isTelephoto = camera.deviceType == .builtInTelephotoCamera
+        let isWide = camera.deviceType == .builtInWideAngleCamera
+
+        // 如果当前设备不适合目标变焦范围，先切换镜头
+        if (needsTelephoto && !isTelephoto) || (!needsTelephoto && isTelephoto) {
+            print("[Camera] 变焦 \(String(format: "%.2f", zoom))x 需要切换镜头，当前: \(camera.deviceType.rawValue)")
+            switchToLens(zoom: zoom)
+            return
+        }
+
+        // 同一镜头内直接设置 zoom
         let clamped = max(camera.minAvailableVideoZoomFactor,
                           min(zoom, camera.maxAvailableVideoZoomFactor))
         sessionQueue.async {
@@ -354,11 +387,55 @@ final class CameraManager: NSObject, ObservableObject,
                 camera.videoZoomFactor = clamped
                 Task { @MainActor in self.currentZoom = clamped }
                 camera.unlockForConfiguration()
-                print("[Camera] 变焦设置为 \(String(format: "%.2f", clamped))x, " +
-                      "设备: \(camera.localizedName), " +
-                      "支持最大变焦: \(String(format: "%.2f", camera.maxAvailableVideoZoomFactor))x")
+                print("[Camera] 变焦设置为 \(String(format: "%.2f", clamped))x, 设备: \(camera.localizedName)")
             } catch {
                 print("设置变焦失败：\(error)")
+            }
+        }
+    }
+
+    /// 切换到适合目标变焦倍数的物理镜头
+    private func switchToLens(zoom: CGFloat) {
+        guard let currentInput = videoInput else { return }
+        let position: AVCaptureDevice.Position = isUsingFrontCamera ? .front : .back
+        guard let newCamera = bestCamera(for: position, zoom: zoom) else { return }
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.session.beginConfiguration()
+            self.session.removeInput(currentInput)
+            do {
+                let newInput = try AVCaptureDeviceInput(device: newCamera)
+                if self.session.canAddInput(newInput) {
+                    self.session.addInput(newInput)
+                    self.session.commitConfiguration()
+
+                    Task { @MainActor in
+                        self.videoInput = newInput
+                        self.currentCamera = newCamera
+
+                        // 在新设备上设置 zoom
+                        let clamped = max(newCamera.minAvailableVideoZoomFactor,
+                                          min(zoom, newCamera.maxAvailableVideoZoomFactor))
+                        do {
+                            try newCamera.lockForConfiguration()
+                            newCamera.videoZoomFactor = clamped
+                            newCamera.unlockForConfiguration()
+                            self.currentZoom = clamped
+                            print("[Camera] 切换镜头后 zoom 设置为 \(String(format: "%.2f", clamped))x")
+                        } catch {
+                            print("切换镜头后设置 zoom 失败：\(error)")
+                        }
+                    }
+                } else {
+                    self.session.addInput(currentInput)
+                    self.session.commitConfiguration()
+                    print("[Camera] 无法添加新输入，回退到原设备")
+                }
+            } catch {
+                self.session.addInput(currentInput)
+                self.session.commitConfiguration()
+                print("[Camera] 切换镜头失败：\(error)")
             }
         }
     }
