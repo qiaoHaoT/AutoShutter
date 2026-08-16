@@ -395,7 +395,7 @@ final class CameraManager: NSObject, ObservableObject,
         let settings = AVCapturePhotoSettings()
         settings.isHighResolutionPhotoEnabled = true
         // 最高画质优先：触发系统多帧合成与更深的图像处理管线
-        if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoQualityPrioritization.quality.rawValue {
+        if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.quality.rawValue {
             settings.photoQualityPrioritization = .quality
         }
         // 闪光灯（前置摄像头无闪光灯）
