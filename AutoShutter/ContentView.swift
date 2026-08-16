@@ -12,6 +12,7 @@ import AVFoundation
 /// - 竖滑切换前后摄像头 / 横滑切换模式
 /// - 闪光灯 / 手电筒控制
 /// - 自动拍照浮动面板（点击 ⏱ 弹出）
+@MainActor
 struct ContentView: View {
 
     @StateObject private var cameraManager = CameraManager()
