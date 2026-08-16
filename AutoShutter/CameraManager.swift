@@ -140,14 +140,14 @@ final class CameraManager: NSObject, ObservableObject,
                 self.session.commitConfiguration()
                 return
             }
-            self.currentCamera = camera
 
             // 2. 创建输入
+            var input: AVCaptureDeviceInput?
             do {
-                let input = try AVCaptureDeviceInput(device: camera)
-                if self.session.canAddInput(input) {
-                    self.session.addInput(input)
-                    self.videoInput = input
+                let newInput = try AVCaptureDeviceInput(device: camera)
+                if self.session.canAddInput(newInput) {
+                    self.session.addInput(newInput)
+                    input = newInput
                 }
             } catch {
                 Task { @MainActor in self.errorMessage = "无法创建相机输入：\(error.localizedDescription)" }
@@ -168,10 +168,11 @@ final class CameraManager: NSObject, ObservableObject,
 
             self.session.commitConfiguration()
 
-            // 5. 配置设备默认参数（对焦、曝光模式）
-            self.configureDeviceDefaults()
-
+            // 5. 回到主线程：记录设备状态、配置默认参数并启动会话
             Task { @MainActor in
+                self.currentCamera = camera
+                self.videoInput = input
+                self.configureDeviceDefaults()
                 self.session.startRunning()
                 self.isSessionRunning = self.session.isRunning
             }
@@ -234,11 +235,12 @@ final class CameraManager: NSObject, ObservableObject,
                 let newInput = try AVCaptureDeviceInput(device: newCamera)
                 if self.session.canAddInput(newInput) {
                     self.session.addInput(newInput)
-                    self.videoInput = newInput
-                    self.currentCamera = newCamera
                     self.session.commitConfiguration()
-                    // 前置摄像头无闪光灯，自动切换为关闭
+                    // 回到主线程更新设备状态
                     Task { @MainActor in
+                        self.videoInput = newInput
+                        self.currentCamera = newCamera
+                        // 前置摄像头无闪光灯，自动切换为关闭
                         self.isUsingFrontCamera.toggle()
                         if self.isUsingFrontCamera {
                             self.flash = .off
@@ -334,17 +336,18 @@ final class CameraManager: NSObject, ObservableObject,
     /// 视频模式：切换手电筒
     func toggleTorch() {
         guard let camera = currentCamera, camera.hasTorch else { return }
+        let turnOn = !isTorchOn
         sessionQueue.async { [weak self] in
             guard let self else { return }
             do {
                 try camera.lockForConfiguration()
-                if self.isTorchOn {
-                    camera.torchMode = .off
-                } else {
+                if turnOn {
                     try camera.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
+                } else {
+                    camera.torchMode = .off
                 }
                 camera.unlockForConfiguration()
-                Task { @MainActor in self.isTorchOn.toggle() }
+                Task { @MainActor in self.isTorchOn = turnOn }
             } catch {
                 print("切换手电筒失败：\(error)")
             }
