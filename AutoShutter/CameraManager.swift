@@ -92,6 +92,13 @@ final class CameraManager: NSObject, ObservableObject,
     private var recordTimer: Timer?
     private let sessionQueue = DispatchQueue(label: "com.autoshutter.session")
 
+    /// 镜头切换是否进行中（防止捏合手势连续触发重复切换导致 session 状态混乱）
+    private var isSwitchingLens = false
+    /// 切换期间挂起的最新目标变焦倍数（切换完成后一次性应用）
+    private var pendingZoom: CGFloat?
+    /// 缓存后置长焦原生等效倍数（configureSession 时更新，避免频繁查询设备）
+    private var cachedTelephotoNativeZoom: CGFloat = 5.0
+
     /// 用于保存最近一张照片缩略图的回调
     var onPhotoCaptured: ((UIImage) -> Void)?
 
@@ -259,6 +266,7 @@ final class CameraManager: NSObject, ObservableObject,
             Task { @MainActor in
                 self.currentCamera = camera
                 self.videoInput = input
+                self.cachedTelephotoNativeZoom = Self.telephotoNativeZoom(position: .back)
                 self.configureDeviceDefaults()
                 self.session.startRunning()
                 self.isSessionRunning = self.session.isRunning
@@ -322,7 +330,10 @@ final class CameraManager: NSObject, ObservableObject,
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.session.beginConfiguration()
-            self.session.removeInput(currentInput)
+            // 仅移除当前实际存在的输入
+            if self.session.inputs.contains(currentInput) {
+                self.session.removeInput(currentInput)
+            }
             do {
                 let newInput = try AVCaptureDeviceInput(device: newCamera)
                 if self.session.canAddInput(newInput) {
@@ -336,17 +347,23 @@ final class CameraManager: NSObject, ObservableObject,
                         self.isUsingFrontCamera.toggle()
                         if self.isUsingFrontCamera {
                             self.flash = .off
+                            // 夜间模式仅后置可用，切到前置时关闭
+                            self.isNightMode = false
                         }
                         self.setZoom(1.0)
                         self.exposureTargetBias = 0
                         self.setExposureTargetBias(0)
                     }
                 } else {
-                    self.session.addInput(currentInput)
+                    if self.session.inputs.contains(currentInput) {
+                        self.session.addInput(currentInput)
+                    }
                     self.session.commitConfiguration()
                 }
             } catch {
-                self.session.addInput(currentInput)
+                if self.session.inputs.contains(currentInput) {
+                    self.session.addInput(currentInput)
+                }
                 self.session.commitConfiguration()
             }
         }
@@ -405,22 +422,50 @@ final class CameraManager: NSObject, ObservableObject,
     /// - 达到长焦原生倍数（如 5x）时自动切换到长焦镜头
     /// - 低于该倍数时使用广角主摄（数字变焦）
     /// - 在长焦镜头上，设备的 videoZoomFactor 需要除以长焦原生倍数换算
+    /// - 使用滞回阈值（升到 teleNative 切长焦，降到 teleNative*0.95 才切回广角），
+    ///   避免在边界附近反复切换
+    /// - 切换进行中只挂起最新目标，切换完成后一次性应用，防止捏合手势
+    ///   连续触发多个切换任务排队导致 AVCaptureSession 状态混乱崩溃
     func setZoom(_ zoom: CGFloat) {
         guard let camera = currentCamera else { return }
-        let position: AVCaptureDevice.Position = isUsingFrontCamera ? .front : .back
-        let teleNative = Self.telephotoNativeZoom(position: position)
+        let teleNative = isUsingFrontCamera ? 5.0 : cachedTelephotoNativeZoom
 
-        let needsTelephoto = zoom >= teleNative - 0.01
         let isTelephoto = camera.deviceType == .builtInTelephotoCamera
+        let isWide = camera.deviceType == .builtInWideAngleCamera
+        let isBack = !isUsingFrontCamera
+        // 滞回阈值：仅后置的广角/长焦之间需要手动切换；
+        // 前置与虚拟多摄设备（Triple/DualWide）跟随设备自动变焦，不强制切换
+        let needsSwitch: Bool
+        if isBack && isTelephoto {
+            needsSwitch = zoom < teleNative * 0.95
+        } else if isBack && isWide {
+            needsSwitch = zoom >= teleNative
+        } else {
+            needsSwitch = false
+        }
 
-        // 如果当前设备不适合目标变焦范围，先切换镜头
-        if (needsTelephoto && !isTelephoto) || (!needsTelephoto && isTelephoto) {
+        // 需要切换镜头
+        if needsSwitch {
+            // 已在切换中：只记录最新目标，等待切换完成后再应用
+            if isSwitchingLens {
+                pendingZoom = zoom
+                print("[Camera] 切换进行中，挂起目标 zoom \(String(format: "%.2f", zoom))x")
+                return
+            }
+            isSwitchingLens = true
+            pendingZoom = nil
             print("[Camera] 变焦 \(String(format: "%.2f", zoom))x 需要切换镜头，当前: \(camera.deviceType.rawValue)")
             switchToLens(zoom: zoom)
             return
         }
 
-        // 同一镜头内直接设置 zoom（长焦镜头需换算为设备系数）
+        // 同一镜头内直接设置 zoom
+        applyZoom(camera, zoom: zoom, teleNative: teleNative)
+    }
+
+    /// 在当前设备上直接设置变焦倍数（长焦镜头需换算为设备系数）
+    private func applyZoom(_ camera: AVCaptureDevice, zoom: CGFloat, teleNative: CGFloat) {
+        let isTelephoto = camera.deviceType == .builtInTelephotoCamera
         let deviceFactor = isTelephoto ? zoom / teleNative : zoom
         let clamped = max(camera.minAvailableVideoZoomFactor,
                           min(deviceFactor, camera.maxAvailableVideoZoomFactor))
@@ -440,52 +485,71 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
-    /// 切换到适合目标变焦倍数的物理镜头
+    /// 切换到适合目标变焦倍数的物理镜头。
+    /// 切换完成后回到主线程更新设备状态，并应用挂起的最新目标倍数。
     private func switchToLens(zoom: CGFloat) {
-        guard let currentInput = videoInput else { return }
+        guard let currentInput = videoInput else {
+            isSwitchingLens = false
+            return
+        }
         let position: AVCaptureDevice.Position = isUsingFrontCamera ? .front : .back
-        guard let newCamera = bestCamera(for: position, zoom: zoom) else { return }
-        let teleNative = Self.telephotoNativeZoom(position: position)
-        let isTelephoto = newCamera.deviceType == .builtInTelephotoCamera
+        guard let newCamera = bestCamera(for: position, zoom: zoom) else {
+            isSwitchingLens = false
+            return
+        }
+        // 目标设备与当前相同（如无长焦机型 / 前置摄像头），无需切换，
+        // 直接在当前设备上设置目标倍数（不走 setZoom 避免递归）
+        if newCamera === currentCamera {
+            isSwitchingLens = false
+            applyZoom(newCamera, zoom: zoom, teleNative: isUsingFrontCamera ? 5.0 : cachedTelephotoNativeZoom)
+            return
+        }
 
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.session.beginConfiguration()
-            self.session.removeInput(currentInput)
+            // 仅移除当前实际存在的输入，避免重复移除导致 session 异常
+            if self.session.inputs.contains(currentInput) {
+                self.session.removeInput(currentInput)
+            }
             do {
                 let newInput = try AVCaptureDeviceInput(device: newCamera)
                 if self.session.canAddInput(newInput) {
                     self.session.addInput(newInput)
                     self.session.commitConfiguration()
 
+                    // 回到主线程更新设备状态，并应用目标倍数
                     Task { @MainActor in
                         self.videoInput = newInput
                         self.currentCamera = newCamera
-
-                        // 在新设备上设置 zoom（长焦镜头需换算为设备系数）
-                        let deviceFactor = isTelephoto ? zoom / teleNative : zoom
-                        let clamped = max(newCamera.minAvailableVideoZoomFactor,
-                                          min(deviceFactor, newCamera.maxAvailableVideoZoomFactor))
-                        let displayZoom = isTelephoto ? clamped * teleNative : clamped
-                        do {
-                            try newCamera.lockForConfiguration()
-                            newCamera.videoZoomFactor = clamped
-                            newCamera.unlockForConfiguration()
-                            self.currentZoom = displayZoom
-                            print("[Camera] 切换镜头后 zoom 设置为 \(String(format: "%.2f", displayZoom))x " +
-                                  "(设备系数 \(String(format: "%.2f", clamped))), 设备: \(newCamera.localizedName)")
-                        } catch {
-                            print("切换镜头后设置 zoom 失败：\(error)")
-                        }
+                        let target = self.pendingZoom ?? zoom
+                        self.pendingZoom = nil
+                        self.isSwitchingLens = false
+                        self.setZoom(target)
+                        print("[Camera] 镜头切换完成: \(newCamera.localizedName)")
                     }
                 } else {
-                    self.session.addInput(currentInput)
+                    // 添加失败：把原输入加回，保持会话有效
+                    if self.session.inputs.contains(currentInput) {
+                        self.session.addInput(currentInput)
+                    }
                     self.session.commitConfiguration()
+                    Task { @MainActor in
+                        self.isSwitchingLens = false
+                        self.setZoom(zoom)
+                    }
                     print("[Camera] 无法添加新输入，回退到原设备")
                 }
             } catch {
-                self.session.addInput(currentInput)
+                // 创建输入失败：把原输入加回，保持会话有效
+                if self.session.inputs.contains(currentInput) {
+                    self.session.addInput(currentInput)
+                }
                 self.session.commitConfiguration()
+                Task { @MainActor in
+                    self.isSwitchingLens = false
+                    self.setZoom(zoom)
+                }
                 print("[Camera] 切换镜头失败：\(error)")
             }
         }
@@ -528,7 +592,9 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
-    /// 切换夜间模式（照片模式）
+    /// 切换夜间模式（照片模式）。
+    /// 开启：锁定 1/4s 长曝光 + 高 ISO + 低光增强（模拟原相机夜间模式效果）
+    /// 关闭：恢复标准连续自动曝光
     func toggleNightMode() {
         guard currentMode == .photo, !isUsingFrontCamera else { return }
         let turnOn = !isNightMode
@@ -540,21 +606,25 @@ final class CameraManager: NSObject, ObservableObject,
             do {
                 try camera.lockForConfiguration()
                 if turnOn {
-                    // 使用自动曝光模式，但允许更长的曝光时间（提升亮度）
-                    if camera.isExposureModeSupported(.autoExpose) {
-                        camera.exposureMode = .autoExpose
+                    // 1. 低光增强：暗光下自动提升传感器增益（原相机夜间模式核心之一）
+                    if camera.isLowLightBoostSupported {
+                        camera.isLowLightBoostEnabled = true
+                        print("[Camera] 夜间模式：已启用低光增强 Low Light Boost")
                     }
-                    // 设置曝光补偿为 +1.0（增加亮度）
-                    camera.setExposureTargetBias(1.0, completionHandler: nil)
-                    // 尝试提升 ISO 上限（如果支持）
-                    let maxISO = min(camera.activeFormat.maxISO, 3200)
-                    camera.setExposureModeCustom(duration: AVCaptureDevice.currentExposureDuration, iso: maxISO, completionHandler: nil)
-                    // 恢复自动曝光以允许系统继续自动调整
-                    if camera.isExposureModeSupported(.autoExpose) {
-                        camera.exposureMode = .autoExpose
+                    // 2. 锁定长曝光（1/4 秒）+ 较高 ISO：暗光下显著更亮
+                    if camera.isExposureModeSupported(.custom) {
+                        let nightDuration = CMTime(seconds: 1.0 / 4.0, preferredTimescale: 600)
+                        let nightISO = min(camera.activeFormat.maxISO, 2500)
+                        camera.setExposureModeCustom(duration: nightDuration,
+                                                     iso: nightISO,
+                                                     completionHandler: nil)
+                        print("[Camera] 夜间模式：锁定曝光 1/4s, ISO \(Int(nightISO))")
                     }
                 } else {
-                    // 关闭夜间模式：恢复标准自动曝光
+                    // 关闭夜间模式：恢复标准自动曝光 + 关闭低光增强
+                    if camera.isLowLightBoostSupported {
+                        camera.isLowLightBoostEnabled = false
+                    }
                     if camera.isExposureModeSupported(.continuousAutoExposure) {
                         camera.exposureMode = .continuousAutoExposure
                     }
@@ -562,7 +632,7 @@ final class CameraManager: NSObject, ObservableObject,
                 }
                 camera.unlockForConfiguration()
                 Task { @MainActor in
-                    self.exposureTargetBias = turnOn ? 1.0 : 0
+                    self.exposureTargetBias = 0
                 }
                 print("[Camera] 夜间模式 \(turnOn ? "开启" : "关闭")")
             } catch {
