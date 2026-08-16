@@ -157,6 +157,19 @@ struct ContentView: View {
             }
             .disabled(cameraManager.isUsingFrontCamera && cameraManager.currentMode == .photo)
 
+            // 夜间模式按钮（仅在照片模式 + 后置摄像头时可用）
+            Button {
+                cameraManager.toggleNightMode()
+                haptic(.light)
+            } label: {
+                Image(systemName: nightModeIconName)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(nightModeColor)
+                    .frame(width: 40, height: 40)
+            }
+            .disabled(cameraManager.isUsingFrontCamera || cameraManager.currentMode != .photo)
+            .opacity(cameraManager.isUsingFrontCamera || cameraManager.currentMode != .photo ? 0.3 : 1.0)
+
             Spacer()
 
             // 视频录制指示
@@ -198,6 +211,14 @@ struct ContentView: View {
             return cameraManager.isTorchOn ? "bolt.fill" : "bolt.slash"
         }
         return cameraManager.flash.iconName
+    }
+
+    private var nightModeIconName: String {
+        cameraManager.isNightMode ? "moon.fill" : "moon"
+    }
+
+    private var nightModeColor: Color {
+        cameraManager.isNightMode ? .yellow : .white
     }
 
     private var recordingTimeText: String {
