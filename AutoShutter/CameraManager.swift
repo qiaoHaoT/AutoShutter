@@ -127,6 +127,27 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
+    // MARK: - 摄像头选择
+
+    /// 选择最佳摄像头：优先使用「虚拟多镜头设备」。
+    /// 虚拟设备会在变焦时自动切换物理镜头（长焦/超广角），
+    /// 并启用系统多帧合成处理，画质显著优于单颗广角镜头 + 数字变焦。
+    /// （仅调用 AVCaptureDevice.default 静态 API，线程安全，允许后台队列调用）
+    nonisolated private func bestCamera(for position: AVCaptureDevice.Position) -> AVCaptureDevice? {
+        let types: [AVCaptureDevice.DeviceType] = [
+            .builtInTripleCamera,   // 三镜头（广角+超广角+长焦）
+            .builtInDualWideCamera, // 双镜头（广角+超广角）
+            .builtInDualCamera,     // 双镜头（广角+长焦）
+            .builtInWideAngleCamera // 单广角（兜底）
+        ]
+        for type in types {
+            if let device = AVCaptureDevice.default(type, for: .video, position: position) {
+                return device
+            }
+        }
+        return nil
+    }
+
     /// 在后台队列中配置 AVCaptureSession
     private func configureSession() {
         sessionQueue.async { [weak self] in
@@ -134,8 +155,8 @@ final class CameraManager: NSObject, ObservableObject,
             self.session.beginConfiguration()
             self.session.sessionPreset = .photo
 
-            // 1. 选择后置摄像头
-            guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            // 1. 选择后置摄像头（优先虚拟多镜头设备）
+            guard let camera = self.bestCamera(for: .back) else {
                 Task { @MainActor in self.errorMessage = "未找到后置摄像头。" }
                 self.session.commitConfiguration()
                 return
@@ -159,6 +180,8 @@ final class CameraManager: NSObject, ObservableObject,
             if self.session.canAddOutput(self.photoOutput) {
                 self.session.addOutput(self.photoOutput)
                 self.photoOutput.isHighResolutionCaptureEnabled = true
+                // 允许最高画质优先（启用多帧合成管线的前提）
+                self.photoOutput.maxPhotoQualityPrioritization = .quality
             }
 
             // 4. 视频输出
@@ -223,7 +246,7 @@ final class CameraManager: NSObject, ObservableObject,
     func switchCamera() {
         guard let currentInput = videoInput else { return }
         let targetPosition: AVCaptureDevice.Position = isUsingFrontCamera ? .back : .front
-        guard let newCamera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: targetPosition) else {
+        guard let newCamera = bestCamera(for: targetPosition) else {
             return
         }
 
@@ -368,8 +391,13 @@ final class CameraManager: NSObject, ObservableObject,
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
+        // 默认编码：支持的 iPhone 上 AVCapturePhotoSettings 默认即 HEIF
         let settings = AVCapturePhotoSettings()
         settings.isHighResolutionPhotoEnabled = true
+        // 最高画质优先：触发系统多帧合成与更深的图像处理管线
+        if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoQualityPrioritization.quality.rawValue {
+            settings.photoQualityPrioritization = .quality
+        }
         // 闪光灯（前置摄像头无闪光灯）
         if isUsingFrontCamera {
             settings.flashMode = .off
