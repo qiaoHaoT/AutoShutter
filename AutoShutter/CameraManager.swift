@@ -606,12 +606,9 @@ final class CameraManager: NSObject, ObservableObject,
             do {
                 try camera.lockForConfiguration()
                 if turnOn {
-                    // 1. 低光增强：暗光下自动提升传感器增益（原相机夜间模式核心之一）
-                    if camera.isLowLightBoostSupported {
-                        camera.isLowLightBoostEnabled = true
-                        print("[Camera] 夜间模式：已启用低光增强 Low Light Boost")
-                    }
-                    // 2. 锁定长曝光（1/4 秒）+ 较高 ISO：暗光下显著更亮
+                    // 锁定长曝光（1/4 秒）+ 较高 ISO：暗光下显著更亮
+                    // 注：isLowLightBoostEnabled 在 iOS SDK 中为只读属性，无法手动写入，
+                    //     夜间模式效果完全由下方自定义曝光实现。
                     if camera.isExposureModeSupported(.custom) {
                         let nightDuration = CMTime(seconds: 1.0 / 4.0, preferredTimescale: 600)
                         let nightISO = min(camera.activeFormat.maxISO, 2500)
@@ -621,10 +618,7 @@ final class CameraManager: NSObject, ObservableObject,
                         print("[Camera] 夜间模式：锁定曝光 1/4s, ISO \(Int(nightISO))")
                     }
                 } else {
-                    // 关闭夜间模式：恢复标准自动曝光 + 关闭低光增强
-                    if camera.isLowLightBoostSupported {
-                        camera.isLowLightBoostEnabled = false
-                    }
+                    // 关闭夜间模式：恢复标准自动曝光
                     if camera.isExposureModeSupported(.continuousAutoExposure) {
                         camera.exposureMode = .continuousAutoExposure
                     }
