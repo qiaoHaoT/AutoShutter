@@ -39,41 +39,63 @@ struct ContentView: View {
     // 快门按压动画
     @State private var shutterPressed = false
 
+    // 相机预览区域的实际尺寸（用于坐标转换）
+    @State private var previewSize: CGSize = .zero
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                // 1. 相机预览
-                if cameraManager.isSessionRunning {
-                    cameraPreview
-                } else {
-                    cameraNotRunningView
-                }
-
-                // 2. 对焦框 + 小太阳
-                focusOverlay
-
-                // 3. 变焦环
-                if showZoomRing {
-                    ZoomRingView(zoom: displayedZoom)
-                }
-
-                // 4. 顶部栏 + 自动拍照面板
-                VStack {
+                // 主布局：顶部栏 + 相机预览 + 底部控制（VStack 分隔，不重叠）
+                VStack(spacing: 0) {
+                    // 1. 顶部栏
                     topBar
+                        .padding(.horizontal, 20)
+                        .padding(.top, 8)
+
+                    // 2. 自动拍照面板（展开时位于顶部栏下方）
                     if showAutoPanel {
                         autoCapturePanel
-                            .padding(.top, 12)
+                            .padding(.horizontal, 24)
+                            .padding(.top, 8)
                             .transition(.move(edge: .top).combined(with: .opacity))
+                        Spacer().frame(height: 8)
                     }
-                    Spacer()
-                }
 
-                // 5. 底部控制区
-                VStack {
-                    Spacer()
+                    // 3. 相机预览区域（占据中间剩余空间，不延伸到按钮区）
+                    ZStack {
+                        if cameraManager.isSessionRunning {
+                            cameraPreview
+                        } else {
+                            cameraNotRunningView
+                        }
+
+                        // 对焦框 + 小太阳（仅在预览区域内）
+                        focusOverlay
+
+                        // 变焦环（仅在预览区域内）
+                        if showZoomRing {
+                            ZoomRingView(zoom: displayedZoom)
+                        }
+
+                        // 获取预览区域尺寸
+                        GeometryReader { previewGeo in
+                            Color.clear
+                                .onAppear {
+                                    previewSize = previewGeo.size
+                                }
+                                .onChange(of: previewGeo.size) { _, newSize in
+                                    previewSize = newSize
+                                }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+
+                    // 4. 底部控制区
                     bottomControls
+                        .padding(.bottom, geometry.safeAreaInsets.bottom > 0 ? 8 : 20)
                 }
             }
             .onAppear {
@@ -104,7 +126,8 @@ struct ContentView: View {
             onPinchChanged: { handlePinchChanged($0) },
             onPinchEnded: { handlePinchEnded() }
         )
-        .ignoresSafeArea()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
     }
 
     private var cameraNotRunningView: some View {
@@ -129,10 +152,9 @@ struct ContentView: View {
                 haptic(.light)
             } label: {
                 Image(systemName: flashIconName)
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(.white)
                     .frame(width: 40, height: 40)
-                    .background(.ultraThinMaterial, in: Circle())
             }
             .disabled(cameraManager.isUsingFrontCamera && cameraManager.currentMode == .photo)
 
@@ -164,15 +186,12 @@ struct ContentView: View {
                 haptic(.light)
             } label: {
                 Image(systemName: "timer")
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(.white)
                     .frame(width: 40, height: 40)
-                    .background(.ultraThinMaterial, in: Circle())
             }
             .disabled(cameraManager.isRecording)
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 10)
     }
 
     private var flashIconName: String {
@@ -289,15 +308,15 @@ struct ContentView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 0) {
-            // 1x 变焦按钮
+            // 1. 变焦倍数指示（原相机风格）
             zoomButton
-                .padding(.bottom, 14)
+                .padding(.bottom, 12)
 
-            // 模式条
+            // 2. 模式条（照片 / 视频 / 全景）
             modeBar
-                .padding(.bottom, 10)
+                .padding(.bottom, 16)
 
-            // 工具行：缩略图 / 快门 / 翻转
+            // 3. 工具行：缩略图 / 快门 / 翻转
             HStack(alignment: .center, spacing: 0) {
                 thumbnailButton
                 Spacer()
@@ -306,16 +325,9 @@ struct ContentView: View {
                 flipButton
             }
             .padding(.horizontal, 28)
-            .padding(.bottom, 34)
         }
-        .padding(.top, 8)
-        .background(
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.55)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
+        .padding(.top, 12)
+        .padding(.horizontal, 0)
     }
 
     /// 变焦倍数按钮（点击切换 1x ↔ 上次倍数）
@@ -468,6 +480,14 @@ struct ContentView: View {
         haptic(.light)
     }
 
+    /// 视图坐标 → 设备坐标（0~1，y 翻转）
+    private func convertToDevicePoint(_ point: CGPoint) -> CGPoint {
+        guard previewSize.width > 0, previewSize.height > 0 else {
+            return CGPoint(x: 0.5, y: 0.5)
+        }
+        return CGPoint(x: point.x / previewSize.width, y: 1 - point.y / previewSize.height)
+    }
+
     /// 滑动开始：判断是否从对焦框附近开始（用于曝光调节）
     private func handlePanBegan(_ location: CGPoint) {
         panBeganNearFocus = false
@@ -528,12 +548,6 @@ struct ContentView: View {
     private func handlePinchEnded() {
         zoomBase = displayedZoom
         withAnimation(.easeOut(duration: 0.15)) { showZoomRing = false }
-    }
-
-    /// 视图坐标 → 设备坐标（0~1，y 翻转）
-    private func convertToDevicePoint(_ point: CGPoint) -> CGPoint {
-        let size = UIScreen.main.bounds.size
-        return CGPoint(x: point.x / size.width, y: 1 - point.y / size.height)
     }
 
     /// 1x 变焦切换
