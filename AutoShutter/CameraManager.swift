@@ -152,8 +152,14 @@ final class CameraManager: NSObject, ObservableObject,
             print("  - \(device.deviceType.rawValue): \(device.localizedName), zoom: \(String(format: "%.2f", device.minAvailableVideoZoomFactor))x ~ \(String(format: "%.2f", device.maxAvailableVideoZoomFactor))x")
         }
 
-        // 长焦镜头选择（zoom >= 3.0x 时优先）
-        if zoom >= 3.0 {
+        // 计算长焦镜头的「原生等效变焦倍数」（以广角主摄为 1x 基准）。
+        // 通过视场角(FOV)比例计算：iPhone 16 Pro 的 120mm 长焦 ≈ 5.0x，
+        // iPhone 15 Pro 的 120mm 长焦 ≈ 3.0x。
+        let teleNative = Self.telephotoNativeZoom(devices: devices)
+        print("[Camera] 长焦镜头原生等效变焦: \(String(format: "%.1f", teleNative))x")
+
+        // 长焦镜头选择（达到长焦原生倍数时切换，画质最佳）
+        if zoom >= teleNative - 0.01 {
             if let telephoto = devices.first(where: { $0.deviceType == .builtInTelephotoCamera }) {
                 print("[Camera] 选择长焦镜头: \(telephoto.localizedName)")
                 return telephoto
@@ -173,15 +179,45 @@ final class CameraManager: NSObject, ObservableObject,
         return devices.first
     }
 
+    /// 计算长焦镜头的原生等效变焦倍数（以广角主摄为 1x 基准）。
+    /// 原理：长焦与主摄的水平视场角之比 ≈ 等效变焦倍数。
+    /// 例如主摄 FOV 69°、长焦 FOV 14°，则 69/14 ≈ 5.0x。
+    /// 找不到长焦或数据异常时返回默认 5.0（不影响无长焦机型：调用方仅在
+    /// 找到长焦设备时才使用该值做镜头选择）。
+    nonisolated private static func telephotoNativeZoom(devices: [AVCaptureDevice]) -> CGFloat {
+        guard let tele = devices.first(where: { $0.deviceType == .builtInTelephotoCamera }),
+              let wide = devices.first(where: { $0.deviceType == .builtInWideAngleCamera }) else {
+            return 5.0
+        }
+        // videoFieldOfView 返回 Float，显式转为 CGFloat 以兼容各平台 SDK
+        let wideFOV = CGFloat(wide.activeFormat.videoFieldOfView)
+        let teleFOV = CGFloat(tele.activeFormat.videoFieldOfView)
+        guard wideFOV > 0, teleFOV > 0, wideFOV > teleFOV else { return 5.0 }
+        let ratio = wideFOV / teleFOV
+        // 合理范围 2.0x ~ 10.0x，超出则视为异常数据
+        return (2.0...10.0).contains(ratio) ? ratio : 5.0
+    }
+
+    /// 按位置查询长焦镜头的原生等效变焦倍数（便捷重载）
+    nonisolated private static func telephotoNativeZoom(position: AVCaptureDevice.Position) -> CGFloat {
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInTelephotoCamera, .builtInWideAngleCamera],
+            mediaType: .video,
+            position: position
+        )
+        return telephotoNativeZoom(devices: session.devices)
+    }
+
     /// 在后台队列中配置 AVCaptureSession
     private func configureSession() {
+        // 在主线程（MainActor）读取状态，避免 Sendable 闭包直接访问隔离属性
+        let targetZoom = max(currentZoom, 1.0)
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.session.beginConfiguration()
             self.session.sessionPreset = .photo
 
             // 1. 选择后置摄像头（根据当前变焦倍数选择合适镜头）
-            let targetZoom = self.currentZoom > 1.0 ? self.currentZoom : 1.0
             guard let camera = self.bestCamera(for: .back, zoom: targetZoom) else {
                 Task { @MainActor in self.errorMessage = "未找到后置摄像头。" }
                 self.session.commitConfiguration()
@@ -363,13 +399,17 @@ final class CameraManager: NSObject, ObservableObject,
 
     // MARK: - 变焦控制
 
-    /// 设置变焦倍数。当目标 zoom 跨越物理镜头阈值（3.0x）时，自动切换镜头。
+    /// 设置「等效变焦倍数」（以广角主摄为 1x 基准，与原相机显示一致）。
+    /// - 达到长焦原生倍数（如 5x）时自动切换到长焦镜头
+    /// - 低于该倍数时使用广角主摄（数字变焦）
+    /// - 在长焦镜头上，设备的 videoZoomFactor 需要除以长焦原生倍数换算
     func setZoom(_ zoom: CGFloat) {
         guard let camera = currentCamera else { return }
+        let position: AVCaptureDevice.Position = isUsingFrontCamera ? .front : .back
+        let teleNative = Self.telephotoNativeZoom(position: position)
 
-        let needsTelephoto = zoom >= 3.0
+        let needsTelephoto = zoom >= teleNative - 0.01
         let isTelephoto = camera.deviceType == .builtInTelephotoCamera
-        let isWide = camera.deviceType == .builtInWideAngleCamera
 
         // 如果当前设备不适合目标变焦范围，先切换镜头
         if (needsTelephoto && !isTelephoto) || (!needsTelephoto && isTelephoto) {
@@ -378,16 +418,20 @@ final class CameraManager: NSObject, ObservableObject,
             return
         }
 
-        // 同一镜头内直接设置 zoom
+        // 同一镜头内直接设置 zoom（长焦镜头需换算为设备系数）
+        let deviceFactor = isTelephoto ? zoom / teleNative : zoom
         let clamped = max(camera.minAvailableVideoZoomFactor,
-                          min(zoom, camera.maxAvailableVideoZoomFactor))
+                          min(deviceFactor, camera.maxAvailableVideoZoomFactor))
+        // 显示用的等效倍数
+        let displayZoom = isTelephoto ? clamped * teleNative : clamped
         sessionQueue.async {
             do {
                 try camera.lockForConfiguration()
                 camera.videoZoomFactor = clamped
-                Task { @MainActor in self.currentZoom = clamped }
                 camera.unlockForConfiguration()
-                print("[Camera] 变焦设置为 \(String(format: "%.2f", clamped))x, 设备: \(camera.localizedName)")
+                Task { @MainActor in self.currentZoom = displayZoom }
+                print("[Camera] 变焦设置为 \(String(format: "%.2f", displayZoom))x " +
+                      "(设备系数 \(String(format: "%.2f", clamped))), 设备: \(camera.localizedName)")
             } catch {
                 print("设置变焦失败：\(error)")
             }
@@ -399,6 +443,8 @@ final class CameraManager: NSObject, ObservableObject,
         guard let currentInput = videoInput else { return }
         let position: AVCaptureDevice.Position = isUsingFrontCamera ? .front : .back
         guard let newCamera = bestCamera(for: position, zoom: zoom) else { return }
+        let teleNative = Self.telephotoNativeZoom(position: position)
+        let isTelephoto = newCamera.deviceType == .builtInTelephotoCamera
 
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -414,15 +460,18 @@ final class CameraManager: NSObject, ObservableObject,
                         self.videoInput = newInput
                         self.currentCamera = newCamera
 
-                        // 在新设备上设置 zoom
+                        // 在新设备上设置 zoom（长焦镜头需换算为设备系数）
+                        let deviceFactor = isTelephoto ? zoom / teleNative : zoom
                         let clamped = max(newCamera.minAvailableVideoZoomFactor,
-                                          min(zoom, newCamera.maxAvailableVideoZoomFactor))
+                                          min(deviceFactor, newCamera.maxAvailableVideoZoomFactor))
+                        let displayZoom = isTelephoto ? clamped * teleNative : clamped
                         do {
                             try newCamera.lockForConfiguration()
                             newCamera.videoZoomFactor = clamped
                             newCamera.unlockForConfiguration()
-                            self.currentZoom = clamped
-                            print("[Camera] 切换镜头后 zoom 设置为 \(String(format: "%.2f", clamped))x")
+                            self.currentZoom = displayZoom
+                            print("[Camera] 切换镜头后 zoom 设置为 \(String(format: "%.2f", displayZoom))x " +
+                                  "(设备系数 \(String(format: "%.2f", clamped))), 设备: \(newCamera.localizedName)")
                         } catch {
                             print("切换镜头后设置 zoom 失败：\(error)")
                         }

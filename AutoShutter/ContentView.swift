@@ -8,7 +8,7 @@ import AVFoundation
 /// - 底部模式条（照片 / 视频 / 全景）
 /// - 单击对焦 + 小太阳调曝光
 /// - 双指捏合变焦（变焦环）
-/// - 1x 变焦倍数切换
+/// - 1x / 2x / 5x 变焦预设按钮
 /// - 竖滑切换前后摄像头 / 横滑切换模式
 /// - 闪光灯 / 手电筒控制
 /// - 自动拍照浮动面板（点击 ⏱ 弹出）
@@ -34,7 +34,6 @@ struct ContentView: View {
     @State private var showZoomRing = false
     @State private var zoomBase: CGFloat = 1.0
     @State private var displayedZoom: CGFloat = 1.0
-    @State private var lastZoom: CGFloat = 1.0
 
     // 快门按压动画
     @State private var shutterPressed = false
@@ -306,10 +305,13 @@ struct ContentView: View {
 
     // MARK: - 底部控制区
 
+    /// 常用变焦预设（原相机风格：1x / 2x / 5x）
+    private let zoomPresets: [CGFloat] = [1.0, 2.0, 5.0]
+
     private var bottomControls: some View {
         VStack(spacing: 0) {
-            // 1. 变焦倍数指示（原相机风格）
-            zoomButton
+            // 1. 变焦预设按钮（1x / 2x / 5x）
+            zoomPresetBar
                 .padding(.bottom, 12)
 
             // 2. 模式条（照片 / 视频 / 全景）
@@ -330,23 +332,56 @@ struct ContentView: View {
         .padding(.horizontal, 0)
     }
 
-    /// 变焦倍数按钮（点击切换 1x ↔ 上次倍数）
-    private var zoomButton: some View {
-        Button(action: toggleZoom) {
-            Text(zoomText)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 7)
-                .background(.ultraThinMaterial, in: Capsule())
+    /// 变焦预设按钮组（原相机风格）
+    /// - 点击直接切换到该焦距
+    /// - 当前处于某个预设时，该按钮白色高亮
+    /// - 捏合到非预设值（如 3.4x）时，最近的按钮显示实际值
+    private var zoomPresetBar: some View {
+        HStack(spacing: 24) {
+            ForEach(zoomPresets, id: \.self) { preset in
+                zoomPresetButton(preset)
+            }
         }
     }
 
-    private var zoomText: String {
-        let zoom = cameraManager.currentZoom
-        return zoom.rounded() == zoom
+    private func zoomPresetButton(_ preset: CGFloat) -> some View {
+        let current = cameraManager.currentZoom
+        let isExact = abs(current - preset) < 0.15
+        let isNearest = zoomPresets.min(by: { abs($0 - current) < abs($1 - current) }) == preset
+        // 非预设值时，最近的按钮显示实际倍数（如 3.4x）
+        let text = (isNearest && !isExact) ? formatZoom(current) : formatZoom(preset)
+        // 当前生效的按钮白色高亮（黑字），其余半透明白底白字
+        let isHighlighted = isExact || isNearest
+
+        return Button {
+            selectZoomPreset(preset)
+        } label: {
+            Text(text)
+                .font(.system(size: 14, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(isHighlighted ? .black : .white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(
+                    isHighlighted ? Color.white : Color.white.opacity(0.22),
+                    in: Capsule()
+                )
+        }
+        .animation(.easeInOut(duration: 0.15), value: cameraManager.currentZoom)
+    }
+
+    private func formatZoom(_ zoom: CGFloat) -> String {
+        zoom.rounded() == zoom
             ? String(format: "%.0fx", zoom)
             : String(format: "%.1fx", zoom)
+    }
+
+    /// 切换到预设焦距
+    private func selectZoomPreset(_ preset: CGFloat) {
+        cameraManager.setZoom(preset)
+        displayedZoom = preset
+        zoomBase = preset
+        haptic(.light)
     }
 
     /// 模式条：照片 / 视频 / 全景
@@ -548,17 +583,6 @@ struct ContentView: View {
     private func handlePinchEnded() {
         zoomBase = displayedZoom
         withAnimation(.easeOut(duration: 0.15)) { showZoomRing = false }
-    }
-
-    /// 1x 变焦切换
-    private func toggleZoom() {
-        if cameraManager.currentZoom > 1.05 {
-            lastZoom = cameraManager.currentZoom
-            cameraManager.setZoom(1.0)
-        } else {
-            cameraManager.setZoom(max(lastZoom, 1.0))
-        }
-        haptic(.light)
     }
 
     /// 选择模式
