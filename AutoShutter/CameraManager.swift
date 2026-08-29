@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import Photos
 import UIKit
 
@@ -9,7 +10,6 @@ import UIKit
 enum CameraMode: String, CaseIterable, Identifiable {
     case photo = "照片"
     case video = "视频"
-    case pano = "全景"
 
     var id: String { rawValue }
 }
@@ -72,7 +72,7 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var isUsingFrontCamera = false
     /// 是否正在录制视频
     @Published var isRecording = false
-    /// 当前相机模式（照片/视频/全景）
+    /// 当前相机模式（照片/视频）
     @Published var currentMode: CameraMode = .photo
     /// 视频已录制时长（秒）
     @Published var recordingTime: TimeInterval = 0
@@ -80,6 +80,10 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var isTorchOn = false
     /// 夜间模式是否开启（照片模式）
     @Published var isNightMode = false
+    /// 拍照音效是否静音
+    @Published var isMuted = false
+    /// 距离下一次自动拍照的剩余时间（秒，仅自动拍照运行时有效）
+    @Published var secondsUntilNextCapture: Double = 0
 
     // MARK: - 内部属性
 
@@ -90,6 +94,10 @@ final class CameraManager: NSObject, ObservableObject,
     private var currentCamera: AVCaptureDevice?
     private var captureTimer: Timer?
     private var recordTimer: Timer?
+    /// 自动拍照下一次触发时间（用于倒计时显示）
+    private var nextCaptureDate: Date?
+    /// 倒计时刷新定时器
+    private var countdownTimer: Timer?
     private let sessionQueue = DispatchQueue(label: "com.autoshutter.session")
 
     /// 镜头切换是否进行中（防止捏合手势连续触发重复切换导致 session 状态混乱）
@@ -297,12 +305,8 @@ final class CameraManager: NSObject, ObservableObject,
 
     // MARK: - 模式切换
 
-    /// 切换相机模式（照片 / 视频 / 全景）
+    /// 切换相机模式（照片 / 视频）
     func setMode(_ mode: CameraMode) {
-        guard mode != .pano else {
-            errorMessage = "全景模式暂不支持，请使用照片或视频模式。"
-            return
-        }
         currentMode = mode
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -641,6 +645,7 @@ final class CameraManager: NSObject, ObservableObject,
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
+        playShutterSound()
 
         // 显式使用 HEIF/HEVC 编码（如果设备支持），否则回退到 JPEG
         let settings: AVCapturePhotoSettings
@@ -688,6 +693,13 @@ final class CameraManager: NSObject, ObservableObject,
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
+    /// 播放快门音效（受 isMuted 控制）。
+    /// 1108 为 iOS 系统相机快门音效 ID（公开可用的系统音效）。
+    private func playShutterSound() {
+        guard !isMuted else { return }
+        AudioServicesPlaySystemSound(1108)
+    }
+
     // MARK: - 视频录制
 
     /// 开始或停止视频录制
@@ -726,14 +738,35 @@ final class CameraManager: NSObject, ObservableObject,
             return
         }
         isAutoCapturing = true
+        // 每轮自动拍照重新计数
+        captureCount = 0
         // 防止屏幕息屏（保持常亮）
         UIApplication.shared.isIdleTimerDisabled = true
         // 立即拍第一张
         capturePhoto()
-        // 设置定时器，按间隔拍照
-        captureTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        // 调度后续拍摄（链式单次定时器，支持倒计时显示）
+        scheduleNextCapture(after: interval)
+    }
+
+    /// 调度下一次自动拍照，并持续刷新倒计时
+    private func scheduleNextCapture(after interval: TimeInterval) {
+        nextCaptureDate = Date().addingTimeInterval(interval)
+        // 先同步刷新一次倒计时，避免 UI 短暂显示旧值
+        secondsUntilNextCapture = interval
+        // 倒计时刷新（0.2s 粒度）
+        countdownTimer?.invalidate()
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.capturePhoto()
+                guard let self, let date = self.nextCaptureDate else { return }
+                self.secondsUntilNextCapture = max(0, date.timeIntervalSinceNow)
+            }
+        }
+        // 到点拍摄，然后调度下一轮
+        captureTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isAutoCapturing else { return }
+                self.capturePhoto()
+                self.scheduleNextCapture(after: interval)
             }
         }
     }
@@ -742,6 +775,10 @@ final class CameraManager: NSObject, ObservableObject,
     func stopAutoCapture() {
         captureTimer?.invalidate()
         captureTimer = nil
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        nextCaptureDate = nil
+        secondsUntilNextCapture = 0
         isAutoCapturing = false
         // 恢复屏幕自动息屏
         UIApplication.shared.isIdleTimerDisabled = false
@@ -825,6 +862,8 @@ final class CameraManager: NSObject, ObservableObject,
             self.captureCount += 1
             self.onPhotoCaptured?(image)
             self.saveToPhotosLibrary(data: data)
+            // 轻触反馈：自动拍照时也能感知已拍摄
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
     }
 
@@ -852,6 +891,7 @@ final class CameraManager: NSObject, ObservableObject,
 
     deinit {
         captureTimer?.invalidate()
+        countdownTimer?.invalidate()
         recordTimer?.invalidate()
         // 注意：不在此处访问 UIApplication（deinit 非 MainActor 隔离，
         // 常亮状态已在 stopAutoCapture() 中恢复）

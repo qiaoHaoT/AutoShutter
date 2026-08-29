@@ -1,17 +1,19 @@
 import SwiftUI
 import AVFoundation
+import CoreMotion
 
 // MARK: - 主界面
 
 /// 主界面：相机界面与 iPhone 内置相机一致
 /// - 大圆形快门 / 视频红色快门
-/// - 底部模式条（照片 / 视频 / 全景）
+/// - 底部模式条（照片 / 视频）
 /// - 单击对焦 + 小太阳调曝光
 /// - 双指捏合变焦（变焦环）
 /// - 1x / 2x / 5x 变焦预设按钮
 /// - 竖滑切换前后摄像头 / 横滑切换模式
 /// - 闪光灯 / 手电筒控制
-/// - 自动拍照浮动面板（点击 ⏱ 弹出）
+/// - 网格线 / 俯拍水平仪 / 拍照音效开关
+/// - 自动拍照浮动面板（点击 ⏱ 弹出）+ 拍照倒计时提示
 @MainActor
 struct ContentView: View {
 
@@ -40,6 +42,10 @@ struct ContentView: View {
 
     // 相机预览区域的实际尺寸（用于坐标转换）
     @State private var previewSize: CGSize = .zero
+
+    // 网格线 / 水平仪
+    @State private var showGrid = false
+    @StateObject private var levelMonitor = LevelMonitor()
 
     var body: some View {
         GeometryReader { geometry in
@@ -70,12 +76,28 @@ struct ContentView: View {
                             cameraNotRunningView
                         }
 
+                        // 网格线（九宫格构图辅助）
+                        if showGrid {
+                            GridView()
+                        }
+
+                        // 水平仪（俯拍姿态时自动出现，十字对齐后变黄）
+                        if cameraManager.currentMode == .photo, levelMonitor.isNearFlat {
+                            LevelIndicatorView(offset: levelMonitor.tiltOffset,
+                                               isLevel: levelMonitor.isLevel)
+                        }
+
                         // 对焦框 + 小太阳（仅在预览区域内）
                         focusOverlay
 
                         // 变焦环（仅在预览区域内）
                         if showZoomRing {
                             ZoomRingView(zoom: displayedZoom)
+                        }
+
+                        // 自动拍照倒计时提示
+                        if cameraManager.isAutoCapturing {
+                            countdownOverlay
                         }
 
                         // 获取预览区域尺寸
@@ -99,6 +121,10 @@ struct ContentView: View {
             }
             .onAppear {
                 cameraManager.requestPermissionAndConfigure()
+                levelMonitor.start()
+            }
+            .onDisappear {
+                levelMonitor.stop()
             }
             .alert("提示", isPresented: Binding(
                 get: { cameraManager.errorMessage != nil },
@@ -169,6 +195,28 @@ struct ContentView: View {
             }
             .disabled(cameraManager.isUsingFrontCamera || cameraManager.currentMode != .photo)
             .opacity(cameraManager.isUsingFrontCamera || cameraManager.currentMode != .photo ? 0.3 : 1.0)
+
+            // 网格线开关
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { showGrid.toggle() }
+                haptic(.light)
+            } label: {
+                Image(systemName: "grid")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(showGrid ? .yellow : .white)
+                    .frame(width: 40, height: 40)
+            }
+
+            // 拍照音效开关
+            Button {
+                cameraManager.isMuted.toggle()
+                haptic(.light)
+            } label: {
+                Image(systemName: cameraManager.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(cameraManager.isMuted ? .white.opacity(0.5) : .white)
+                    .frame(width: 40, height: 40)
+            }
 
             Spacer()
 
@@ -324,6 +372,50 @@ struct ContentView: View {
         .padding(.horizontal, 24)
     }
 
+    // MARK: - 自动拍照倒计时提示
+
+    /// 自动拍照运行时：顶部常驻倒计时胶囊 + 最后 3 秒大数字提醒
+    private var countdownOverlay: some View {
+        let remaining = cameraManager.secondsUntilNextCapture
+        let countNumber = Int(ceil(remaining))
+        return ZStack {
+            // 顶部常驻：下一张倒计时胶囊
+            VStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "timer")
+                        .font(.footnote.bold())
+                    Text(remaining >= 1
+                         ? String(format: "下一张 %.0f 秒", ceil(remaining))
+                         : "即将拍摄…")
+                        .font(.footnote.bold())
+                        .monospacedDigit()
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.black.opacity(0.45), in: Capsule())
+                .overlay(Capsule().stroke(.white.opacity(0.2), lineWidth: 1))
+                .padding(.top, 12)
+
+                Spacer()
+            }
+
+            // 最后 3 秒：大数字提醒（间隔过短时不再放大字号干扰构图）
+            if remaining > 0.01, remaining <= 3.2, intervalSeconds > 3.05 {
+                Text("\(max(1, countNumber))")
+                    .font(.system(size: 96, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 6)
+                    .id(max(1, countNumber))
+                    .transition(.scale(scale: 1.5).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: max(1, countNumber))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(false)
+    }
+
     // MARK: - 底部控制区
 
     /// 常用变焦预设（原相机风格：1x / 2x / 5x）
@@ -335,7 +427,7 @@ struct ContentView: View {
             zoomPresetBar
                 .padding(.bottom, 12)
 
-            // 2. 模式条（照片 / 视频 / 全景）
+            // 2. 模式条（照片 / 视频）
             modeBar
                 .padding(.bottom, 16)
 
@@ -405,7 +497,7 @@ struct ContentView: View {
         haptic(.light)
     }
 
-    /// 模式条：照片 / 视频 / 全景
+    /// 模式条：照片 / 视频
     private var modeBar: some View {
         HStack(spacing: 46) {
             ForEach(CameraMode.allCases) { mode in
@@ -704,6 +796,142 @@ private struct ZoomRingView: View {
         .shadow(color: .black.opacity(0.4), radius: 8)
         .transition(.opacity)
         .allowsHitTesting(false)
+    }
+}
+
+// MARK: - 网格线（九宫格构图辅助）
+
+private struct GridView: View {
+    var body: some View {
+        GeometryReader { geo in
+            Path { path in
+                let w = geo.size.width
+                let h = geo.size.height
+                // 两条竖线（1/3、2/3）
+                for i in 1...2 {
+                    let x = w * CGFloat(i) / 3
+                    path.move(to: CGPoint(x: x, y: 0))
+                    path.addLine(to: CGPoint(x: x, y: h))
+                }
+                // 两条横线（1/3、2/3）
+                for i in 1...2 {
+                    let y = h * CGFloat(i) / 3
+                    path.move(to: CGPoint(x: 0, y: y))
+                    path.addLine(to: CGPoint(x: w, y: y))
+                }
+            }
+            .stroke(.white.opacity(0.35), lineWidth: 0.5)
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - 水平仪（俯拍十字）
+
+/// 十字水平仪：中心固定十字 + 随倾斜移动的小十字，对齐后变黄（对齐 iPhone 原相机俯拍水平仪）
+private struct LevelIndicatorView: View {
+    /// 移动十字相对中心的偏移（pt）
+    let offset: CGSize
+    /// 是否已对齐水平
+    let isLevel: Bool
+
+    var body: some View {
+        ZStack {
+            // 固定十字（中心基准）
+            CrossShape()
+                .stroke(.white.opacity(0.9), lineWidth: 1.5)
+                .frame(width: 32, height: 32)
+
+            // 移动十字（随倾斜移动）
+            CrossShape()
+                .stroke(isLevel ? .yellow : .white.opacity(0.85), lineWidth: 2.5)
+                .frame(width: 22, height: 22)
+                .offset(offset)
+                .animation(.easeOut(duration: 0.08), value: offset)
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// 十字形状（一横一竖两条线）
+private struct CrossShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+        path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+        return path
+    }
+}
+
+// MARK: - 水平仪姿态监测
+
+/// 监测设备姿态：俯拍姿态（屏幕朝上、镜头朝下）时提供十字水平仪数据。
+/// - tiltOffset：移动十字相对中心的偏移（pt），由重力在屏幕平面的投影换算
+/// - isNearFlat：接近俯拍姿态（此时才显示水平仪）
+/// - isLevel：已对齐水平（十字重合，UI 变黄并触发一次触觉反馈）
+@MainActor
+final class LevelMonitor: ObservableObject {
+
+    @Published var tiltOffset: CGSize = .zero
+    @Published var isNearFlat = false
+    @Published var isLevel = false
+
+    private let motion = CMMotionManager()
+    /// 重力投影 → 屏幕 pt 的换算系数
+    private let offsetScale: CGFloat = 300
+    /// 十字最大偏移（pt）
+    private let maxOffset: CGFloat = 60
+    /// 判定水平的重力分量阈值（约 ±2.5°）
+    private let levelThreshold: Double = 0.045
+    /// 判定接近俯拍姿态的 z 分量阈值（屏幕朝上时 gravity.z ≈ -1）
+    private let flatThreshold: Double = -0.85
+    /// 是否已触发过水平触觉反馈（避免连续震动）
+    private var levelHapticFired = false
+
+    func start() {
+        guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
+        motion.deviceMotionUpdateInterval = 1.0 / 30.0
+        motion.startDeviceMotionUpdates(to: .main) { [weak self] motionData, _ in
+            guard let gravity = motionData?.gravity else { return }
+            let gx = gravity.x
+            let gy = gravity.y
+            let gz = gravity.z
+            Task { @MainActor in
+                self?.handleGravity(x: gx, y: gy, z: gz)
+            }
+        }
+    }
+
+    func stop() {
+        motion.stopDeviceMotionUpdates()
+    }
+
+    private func handleGravity(x: Double, y: Double, z: Double) {
+        // 屏幕朝上（俯拍）：gravity.z ≈ -1
+        let nearFlat = z < flatThreshold
+        isNearFlat = nearFlat
+        guard nearFlat else {
+            isLevel = false
+            levelHapticFired = false
+            return
+        }
+        // 右倾（gravity.x > 0）→ 十字向右；上端下沉（gravity.y > 0）→ 十字向上
+        let dx = CGFloat(x) * offsetScale
+        let dy = CGFloat(-y) * offsetScale
+        tiltOffset = CGSize(width: min(max(dx, -maxOffset), maxOffset),
+                            height: min(max(dy, -maxOffset), maxOffset))
+        let leveled = abs(x) < levelThreshold && abs(y) < levelThreshold
+        isLevel = leveled
+        if leveled, !levelHapticFired {
+            levelHapticFired = true
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } else if !leveled {
+            levelHapticFired = false
+        }
     }
 }
 
