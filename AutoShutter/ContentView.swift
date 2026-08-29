@@ -743,7 +743,7 @@ private struct ShutterButtonStyle: ButtonStyle {
 private struct FocusBoxView: View {
     var body: some View {
         RoundedRectangle(cornerRadius: 14)
-            .stroke(.yellow, lineWidth: 2)
+            .stroke(.yellow, lineWidth: 1.2)
     }
 }
 
@@ -826,13 +826,13 @@ private struct LevelIndicatorView: View {
             // 固定虚线（水平参考，对齐时淡出）
             VerticalLineShape()
                 .stroke(.white.opacity(isLevel ? 0 : 0.75),
-                        style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [4, 5]))
+                        style: StrokeStyle(lineWidth: 1.3, lineCap: .round, dash: [4, 5]))
                 .frame(width: 2, height: 70)
                 .animation(.easeOut(duration: 0.15), value: isLevel)
 
             // 移动实线（随倾斜偏移 + 旋转，对齐时变黄）
             VerticalLineShape()
-                .stroke(isLevel ? .yellow : .white, lineWidth: 2.5)
+                .stroke(isLevel ? .yellow : .white, lineWidth: 1.8)
                 .frame(width: 2, height: 320)
                 .rotationEffect(.degrees(rotationAngle))
                 .offset(offset)
