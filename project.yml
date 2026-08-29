@@ -27,7 +27,7 @@ targets:
     info:
       path: AutoShutter/Info.plist
       properties:
-        CFBundleDisplayName: "自动快门"
+        CFBundleDisplayName: "拍刻"
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         UILaunchScreen:

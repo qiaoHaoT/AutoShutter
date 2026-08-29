@@ -9,7 +9,7 @@
 	<key>CFBundleName</key>
 	<string>AutoShutter</string>
 	<key>CFBundleDisplayName</key>
-	<string>自动快门</string>
+	<string>拍刻</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.autoshutter.app</string>
 	<key>CFBundleVersion</key>

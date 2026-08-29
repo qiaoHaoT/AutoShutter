@@ -1,4 +1,4 @@
-# 自动快门 AutoShutter
+# 拍刻 AutoShutter
 
 一款 iOS 自动定时拍照 App，相机界面与交互对齐 iPhone 内置原相机，支持自定义间隔时间自动拍照。
 
