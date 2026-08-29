@@ -612,7 +612,8 @@ final class CameraManager: NSObject, ObservableObject,
         // 静音时抑制系统内置快门音效（iOS 18+ 官方 API）。
         // 拍照时系统会自动播放快门声（隐私政策），此开关将其关闭；
         // 部分地区（如日/韩）法律要求快门声不可关闭，此时 isShutterSoundSuppressionSupported 为 false。
-        if isMuted, photoOutput.isShutterSoundSuppressionSupported {
+        // 注：CI 命令行将部署目标覆盖为 iOS 17，故需 #available 守卫；iOS 17 设备保持默认播放快门声。
+        if isMuted, #available(iOS 18.0, *), photoOutput.isShutterSoundSuppressionSupported {
             settings.isShutterSoundSuppressionEnabled = true
         }
         // 闪光灯（前置摄像头无闪光灯）
