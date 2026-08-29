@@ -39,8 +39,7 @@ jobs:
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            IPHONEOS_DEPLOYMENT_TARGET=17.0 2>&1 | tee build/build.log
+            CODE_SIGN_IDENTITY="" 2>&1 | tee build/build.log
 
       - name: Upload build log
         if: always()

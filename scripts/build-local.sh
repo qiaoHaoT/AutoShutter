@@ -45,8 +45,7 @@ xcodebuild archive \
     -configuration Release \
     CODE_SIGNING_ALLOWED=NO \
     CODE_SIGNING_REQUIRED=NO \
-    CODE_SIGN_IDENTITY="" \
-    IPHONEOS_DEPLOYMENT_TARGET=17.0
+    CODE_SIGN_IDENTITY=""
 
 # 4. 打包 IPA
 echo ""

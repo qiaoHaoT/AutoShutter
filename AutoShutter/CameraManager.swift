@@ -130,6 +130,8 @@ final class CameraManager: NSObject, ObservableObject,
     private var pendingLiveMovies: [Int64: URL] = [:]
     /// 当前正在进行的实况拍摄 uniqueID 集合（用于区分普通照片）
     private var liveShotIDs: Set<Int64> = []
+    /// 当前正在进行的 ProRAW 拍摄 uniqueID 集合（用于丢弃伴随的处理图，避免相册重复）
+    private var rawShotIDs: Set<Int64> = []
 
     /// 镜头切换是否进行中（防止捏合手势连续触发重复切换导致 session 状态混乱）
     private var isSwitchingLens = false
@@ -152,7 +154,7 @@ final class CameraManager: NSObject, ObservableObject,
     /// 是否支持实况照片
     var isLivePhotoSupported: Bool { photoOutput.isLivePhotoCaptureSupported }
     /// 是否支持 Apple ProRAW
-    var isRawSupported: Bool { photoOutput.isRawPhotoCaptureSupported }
+    var isRawSupported: Bool { photoOutput.isAppleProRAWSupported }
 
     // MARK: - 权限与会话配置
 
@@ -646,7 +648,7 @@ final class CameraManager: NSObject, ObservableObject,
 
     /// 切换 Apple ProRAW 开关
     func toggleRaw() {
-        guard photoOutput.isRawPhotoCaptureSupported else {
+        guard photoOutput.isAppleProRAWSupported else {
             errorMessage = "此设备不支持 Apple ProRAW。"
             return
         }
@@ -655,18 +657,26 @@ final class CameraManager: NSObject, ObservableObject,
 
     // MARK: - 拍照
 
+    /// 挑选用于拍摄的 RAW 像素格式：优先 Apple ProRAW，设备不支持时退回 Bayer RAW
+    private func preferredRawPixelFormatType() -> OSType? {
+        let types = photoOutput.availableRawPhotoPixelFormatTypes
+        return types.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } ?? types.first
+    }
+
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
 
         let settings: AVCapturePhotoSettings
         // Apple ProRAW（raw + HEIF 预览），优先于实况
-        if isRawEnabled, photoOutput.isRawPhotoCaptureSupported,
-           let rawType = photoOutput.rawPhotoPixelFormatTypes.first {
+        if isRawEnabled, photoOutput.isAppleProRAWSupported,
+           let rawType = preferredRawPixelFormatType() {
             let processedFormat: [String: Any]? = photoOutput.availablePhotoCodecTypes.contains(.hevc)
                 ? [AVVideoCodecKey: AVVideoCodecType.hevc]
                 : nil
             settings = AVCapturePhotoSettings(rawPixelFormatType: rawType, processedFormat: processedFormat)
+            // 标记本次为 RAW 拍摄：委托会回调两次（DNG + 处理图），只保存 DNG
+            rawShotIDs.insert(settings.uniqueID)
         } else if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
             settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
         } else {
@@ -680,7 +690,7 @@ final class CameraManager: NSObject, ObservableObject,
         // 静音时抑制系统内置快门音效（iOS 18+ 官方 API）。
         // 拍照时系统会自动播放快门声（隐私政策），此开关将其关闭；
         // 部分地区（如日/韩）法律要求快门声不可关闭，此时 isShutterSoundSuppressionSupported 为 false。
-        // 注：CI 命令行将部署目标覆盖为 iOS 17，故需 #available 守卫；iOS 17 设备保持默认播放快门声。
+        // 注：该 API 为 iOS 18+，需 #available 守卫；iOS 17 设备保持默认播放快门声。
         if isMuted, #available(iOS 18.0, *), photoOutput.isShutterSoundSuppressionSupported {
             settings.isShutterSoundSuppressionEnabled = true
         }
@@ -973,31 +983,38 @@ final class CameraManager: NSObject, ObservableObject,
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
                                  didFinishProcessingPhoto photo: AVCapturePhoto,
                                  error: Error?) {
-        guard error == nil,
-              let processedData = photo.fileDataRepresentation(),
-              let image = UIImage(data: processedData) else {
+        guard error == nil, let fileData = photo.fileDataRepresentation() else {
             Task { @MainActor in
                 self.errorMessage = "拍照失败：\(error?.localizedDescription ?? "未知错误")"
             }
             return
         }
         let uniqueID = photo.resolvedSettings.uniqueID
-        // RAW 拍摄：优先使用 DNG 数据；非 RAW 用处理后的 HEIF/JPEG
-        let dngData = photo.dngFileDataRepresentation()
-        let isRaw = dngData != nil
-        let savedData = dngData ?? processedData
+        // fileDataRepresentation() 对 RAW 照片返回 DNG，对处理图返回 HEIF/JPEG
+        let isRaw = photo.isRawPhoto
+        // DNG 解码开销大，缩略图交给伴随的处理图更新
+        let thumbnail = isRaw ? nil : UIImage(data: fileData)
 
         Task { @MainActor in
-            self.captureCount += 1
-            self.onPhotoCaptured?(image)
-            if self.liveShotIDs.contains(uniqueID) {
+            if isRaw {
+                // Apple ProRAW：保存 DNG，不注入 GPS（DNG 注入风险高）
+                self.rawShotIDs.remove(uniqueID)
+                self.captureCount += 1
+                self.saveToPhotosLibrary(data: fileData)
+            } else if self.rawShotIDs.contains(uniqueID) {
+                // ProRAW 的伴随处理图：不保存，避免相册出现重复照片
+                self.rawShotIDs.remove(uniqueID)
+            } else if self.liveShotIDs.contains(uniqueID) {
                 // 实况照片：缓存静态数据（注入 GPS），等视频回调后配对保存
-                self.pendingLiveStills[uniqueID] = self.photoDataInjectingGPS(savedData)
+                self.captureCount += 1
+                self.pendingLiveStills[uniqueID] = self.photoDataInjectingGPS(fileData)
                 self.tryFlushLivePhoto(uniqueID: uniqueID)
             } else {
-                // RAW 数据不注入 GPS（DNG 格式注入风险高），普通照片注入
-                let finalData = isRaw ? savedData : self.photoDataInjectingGPS(savedData)
-                self.saveToPhotosLibrary(data: finalData)
+                self.captureCount += 1
+                self.saveToPhotosLibrary(data: self.photoDataInjectingGPS(fileData))
+            }
+            if let thumbnail {
+                self.onPhotoCaptured?(thumbnail)
             }
             // 轻触反馈：自动拍照时也能感知已拍摄
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
