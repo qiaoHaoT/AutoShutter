@@ -81,13 +81,13 @@ struct ContentView: View {
                             GridView()
                         }
 
-                        // 水平仪（iPhone 原相机水平模式：手机竖立时显示两条竖线，对齐变黄）
-                        if levelMonitor.isUpright {
-                            LevelIndicatorView(offset: levelMonitor.tiltOffset,
-                                               rotationAngle: levelMonitor.rotationAngle,
-                                               isLevel: levelMonitor.isLevel)
-                                .transition(.opacity)
-                        }
+                        // 水平仪（仅在不水平时显示，对齐后淡出，保持画面干净）
+                        LevelIndicatorView(offset: levelMonitor.tiltOffset,
+                                           rotationAngle: levelMonitor.rotationAngle,
+                                           isLevel: levelMonitor.isLevel)
+                            .opacity(levelMonitor.isUpright && !levelMonitor.isLevel ? 1 : 0)
+                            .animation(.easeInOut(duration: 0.25), value: levelMonitor.isLevel)
+                            .animation(.easeInOut(duration: 0.25), value: levelMonitor.isUpright)
 
                         // 对焦框 + 小太阳（仅在预览区域内）
                         focusOverlay
@@ -910,12 +910,16 @@ final class LevelMonitor: ObservableObject {
     private let maxOffset: CGFloat = 120
     /// 重力 → 旋转角度换算系数（度）
     private let rotationScale: Double = 35
-    /// 判定水平的 roll 角阈值（度）
+    /// 判定水平的 roll 角阈值（度，进入）
     private let levelDegreeThreshold: Double = 1.5
+    /// 退出水平态的 roll 角阈值（度，滞回，避免边界抖动）
+    private let levelExitThreshold: Double = 4.0
     /// 显示阈值：|gravity.z| 超过此值视为俯拍/仰拍，隐藏水平仪
     private let uprightGZThreshold: Double = 0.4
     /// 是否已触发过水平触觉反馈（避免连续震动）
     private var levelHapticFired = false
+    /// 水平态锁存（带滞回）：一旦进入水平，需偏离更远才退出
+    private var leveledLatched = false
 
     func start() {
         guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
@@ -944,6 +948,7 @@ final class LevelMonitor: ObservableObject {
             rotationAngle = 0
             isLevel = false
             levelHapticFired = false
+            leveledLatched = false
             return
         }
         // 姿态角（portrait 基准 0°）：竖握水平 0°，横握 ±90°，倒立 180°
@@ -962,13 +967,17 @@ final class LevelMonitor: ObservableObject {
         )
         // 旋转：与偏移同向（小角度近似），使实线倾斜显示当前姿态
         rotationAngle = gxEquivalent * rotationScale
-        // 水平判定
-        let leveled = abs(rollDeg) < levelDegreeThreshold
-        isLevel = leveled
-        if leveled, !levelHapticFired {
+        // 水平判定（带滞回：进入 <1.5°，退出 >4°，避免边界抖动）
+        if abs(rollDeg) < levelDegreeThreshold {
+            leveledLatched = true
+        } else if abs(rollDeg) > levelExitThreshold {
+            leveledLatched = false
+        }
+        isLevel = leveledLatched
+        if isLevel, !levelHapticFired {
             levelHapticFired = true
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        } else if !leveled {
+        } else if !isLevel {
             levelHapticFired = false
         }
     }
