@@ -81,13 +81,12 @@ struct ContentView: View {
                             GridView()
                         }
 
-                        // 水平仪（仅在不水平时显示，对齐后淡出，保持画面干净）
+                        // 水平仪（不水平时显示，水平后保持 1 秒再淡出）
                         LevelIndicatorView(offset: levelMonitor.tiltOffset,
                                            rotationAngle: levelMonitor.rotationAngle,
                                            isLevel: levelMonitor.isLevel)
-                            .opacity(levelMonitor.isUpright && !levelMonitor.isLevel ? 1 : 0)
-                            .animation(.easeInOut(duration: 0.25), value: levelMonitor.isLevel)
-                            .animation(.easeInOut(duration: 0.25), value: levelMonitor.isUpright)
+                            .opacity(levelMonitor.shouldShowLevel ? 1 : 0)
+                            .animation(.easeInOut(duration: 0.25), value: levelMonitor.shouldShowLevel)
 
                         // 对焦框 + 小太阳（仅在预览区域内）
                         focusOverlay
@@ -437,6 +436,13 @@ struct ContentView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 0) {
+            // 0. 实况 / RAW 切换（仅照片模式且设备支持时显示）
+            if cameraManager.currentMode == .photo
+                && (cameraManager.isLivePhotoSupported || cameraManager.isRawSupported) {
+                captureFormatBar
+                    .padding(.bottom, 10)
+            }
+
             // 1. 变焦预设按钮（1x / 2x / 5x）
             zoomPresetBar
                 .padding(.bottom, 12)
@@ -457,6 +463,55 @@ struct ContentView: View {
         }
         .padding(.top, 12)
         .padding(.horizontal, 0)
+    }
+
+    // MARK: - 实况 / RAW 切换栏
+
+    /// 实况照片与 Apple ProRAW 切换（仅照片模式）
+    private var captureFormatBar: some View {
+        HStack(spacing: 28) {
+            if cameraManager.isLivePhotoSupported {
+                Button {
+                    cameraManager.toggleLivePhoto()
+                    haptic(.light)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "livephoto")
+                            .font(.system(size: 14))
+                        Text("实况")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(cameraManager.isLivePhotoEnabled ? .black : .white.opacity(0.85))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        cameraManager.isLivePhotoEnabled ? Color.yellow : Color.white.opacity(0.18),
+                        in: Capsule()
+                    )
+                }
+                .disabled(cameraManager.isRawEnabled)
+                .opacity(cameraManager.isRawEnabled ? 0.4 : 1)
+            }
+
+            if cameraManager.isRawSupported {
+                Button {
+                    cameraManager.toggleRaw()
+                    haptic(.light)
+                } label: {
+                    Text("RAW")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(cameraManager.isRawEnabled ? .black : .white.opacity(0.85))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(
+                            cameraManager.isRawEnabled ? Color.yellow : Color.white.opacity(0.18),
+                            in: Capsule()
+                        )
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 0.15), value: cameraManager.isLivePhotoEnabled)
+        .animation(.easeInOut(duration: 0.15), value: cameraManager.isRawEnabled)
     }
 
     /// 变焦预设按钮组（原相机风格）
@@ -902,6 +957,8 @@ final class LevelMonitor: ObservableObject {
     @Published var rotationAngle: Double = 0
     @Published var isUpright = false
     @Published var isLevel = false
+    /// 是否应显示水平仪（不水平时为 true；水平后保持 1 秒再变 false）
+    @Published var shouldShowLevel = false
 
     private let motion = CMMotionManager()
     /// 重力 → 屏幕 pt 偏移换算系数
@@ -920,6 +977,10 @@ final class LevelMonitor: ObservableObject {
     private var levelHapticFired = false
     /// 水平态锁存（带滞回）：一旦进入水平，需偏离更远才退出
     private var leveledLatched = false
+    /// 进入水平态的时间戳（用于水平后保持显示 1 秒）
+    private var levelEnteredAt: Date?
+    /// 水平后保持显示的时长（秒）
+    private let levelHoldDuration: TimeInterval = 1.0
 
     func start() {
         guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
@@ -949,6 +1010,8 @@ final class LevelMonitor: ObservableObject {
             isLevel = false
             levelHapticFired = false
             leveledLatched = false
+            levelEnteredAt = nil
+            shouldShowLevel = false
             return
         }
         // 姿态角（portrait 基准 0°）：竖握水平 0°，横握 ±90°，倒立 180°
@@ -979,6 +1042,14 @@ final class LevelMonitor: ObservableObject {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } else if !isLevel {
             levelHapticFired = false
+        }
+        // 显示控制：不水平时显示；水平后保持 1 秒（让用户看到黄色对齐）再隐藏
+        if isLevel {
+            if levelEnteredAt == nil { levelEnteredAt = Date() }
+            shouldShowLevel = Date().timeIntervalSince(levelEnteredAt!) < levelHoldDuration
+        } else {
+            levelEnteredAt = nil
+            shouldShowLevel = true
         }
     }
 }

@@ -96,6 +96,10 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var secondsUntilNextCapture: Double = 0
     /// 照片地理位置记录状态
     @Published var locationStatus: LocationStatus = .unknown
+    /// 实况照片（Live Photo）是否开启
+    @Published var isLivePhotoEnabled = false
+    /// Apple ProRAW 是否开启
+    @Published var isRawEnabled = false
 
     // MARK: - 内部属性
 
@@ -118,6 +122,15 @@ final class CameraManager: NSObject, ObservableObject,
     /// 最近一次有效定位（写入照片 EXIF GPS）
     private var latestLocation: CLLocation?
 
+    // MARK: - 实况照片（Live Photo）配对缓存
+
+    /// 等待配对保存的实况照片：uniqueID → 静态照片数据
+    private var pendingLiveStills: [Int64: Data] = [:]
+    /// 等待配对保存的实况照片：uniqueID → 配套视频文件 URL
+    private var pendingLiveMovies: [Int64: URL] = [:]
+    /// 当前正在进行的实况拍摄 uniqueID 集合（用于区分普通照片）
+    private var liveShotIDs: Set<Int64> = []
+
     /// 镜头切换是否进行中（防止捏合手势连续触发重复切换导致 session 状态混乱）
     private var isSwitchingLens = false
     /// 切换期间挂起的最新目标变焦倍数（切换完成后一次性应用）
@@ -135,6 +148,11 @@ final class CameraManager: NSObject, ObservableObject,
     var maxZoom: CGFloat {
         min(currentCamera?.maxAvailableVideoZoomFactor ?? 10.0, 15.0)
     }
+
+    /// 是否支持实况照片
+    var isLivePhotoSupported: Bool { photoOutput.isLivePhotoCaptureSupported }
+    /// 是否支持 Apple ProRAW
+    var isRawSupported: Bool { photoOutput.isRawPhotoCaptureSupported }
 
     // MARK: - 权限与会话配置
 
@@ -280,6 +298,10 @@ final class CameraManager: NSObject, ObservableObject,
                 self.photoOutput.isHighResolutionCaptureEnabled = true
                 // 允许最高画质优先（启用多帧合成管线的前提）
                 self.photoOutput.maxPhotoQualityPrioritization = .quality
+                // 实况照片（Live Photo）输出能力：开启后按需在拍摄设置中附带 movie URL
+                if self.photoOutput.isLivePhotoCaptureSupported {
+                    self.photoOutput.isLivePhotoCaptureEnabled = true
+                }
             }
 
             // 4. 视频输出
@@ -613,15 +635,39 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
+    /// 切换实况照片开关
+    func toggleLivePhoto() {
+        guard photoOutput.isLivePhotoCaptureSupported else {
+            errorMessage = "此设备不支持实况照片。"
+            return
+        }
+        isLivePhotoEnabled.toggle()
+    }
+
+    /// 切换 Apple ProRAW 开关
+    func toggleRaw() {
+        guard photoOutput.isRawPhotoCaptureSupported else {
+            errorMessage = "此设备不支持 Apple ProRAW。"
+            return
+        }
+        isRawEnabled.toggle()
+    }
+
     // MARK: - 拍照
 
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
 
-        // 显式使用 HEIF/HEVC 编码（如果设备支持），否则回退到 JPEG
         let settings: AVCapturePhotoSettings
-        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+        // Apple ProRAW（raw + HEIF 预览），优先于实况
+        if isRawEnabled, photoOutput.isRawPhotoCaptureSupported,
+           let rawType = photoOutput.rawPhotoPixelFormatTypes.first {
+            let processedFormat: [String: Any]? = photoOutput.availablePhotoCodecTypes.contains(.hevc)
+                ? [AVVideoCodecKey: AVVideoCodecType.hevc]
+                : nil
+            settings = AVCapturePhotoSettings(rawPixelFormatType: rawType, processedFormat: processedFormat)
+        } else if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
             settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
         } else {
             settings = AVCapturePhotoSettings()
@@ -660,6 +706,14 @@ final class CameraManager: NSObject, ObservableObject,
         // 设置方向
         if let connection = photoOutput.connection(with: .video) {
             connection.videoOrientation = .portrait
+        }
+        // 实况照片：附带 movie 文件 URL，等待 delegate 配对保存。
+        // RAW 与实况互斥（RAW 优先），避免数据格式冲突。
+        if isLivePhotoEnabled, photoOutput.isLivePhotoCaptureSupported, !isRawEnabled {
+            let movieURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(settings.uniqueID)-live.mov")
+            settings.livePhotoMovieFileURL = movieURL
+            liveShotIDs.insert(settings.uniqueID)
         }
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
@@ -920,22 +974,89 @@ final class CameraManager: NSObject, ObservableObject,
                                  didFinishProcessingPhoto photo: AVCapturePhoto,
                                  error: Error?) {
         guard error == nil,
-              let data = photo.fileDataRepresentation(),
-              let image = UIImage(data: data) else {
+              let processedData = photo.fileDataRepresentation(),
+              let image = UIImage(data: processedData) else {
             Task { @MainActor in
                 self.errorMessage = "拍照失败：\(error?.localizedDescription ?? "未知错误")"
             }
             return
         }
+        let uniqueID = photo.resolvedSettings.uniqueID
+        // RAW 拍摄：优先使用 DNG 数据；非 RAW 用处理后的 HEIF/JPEG
+        let dngData = photo.dngFileDataRepresentation()
+        let isRaw = dngData != nil
+        let savedData = dngData ?? processedData
 
         Task { @MainActor in
             self.captureCount += 1
             self.onPhotoCaptured?(image)
-            // 写入 GPS 后再保存到相册
-            let finalData = self.photoDataInjectingGPS(data)
-            self.saveToPhotosLibrary(data: finalData)
+            if self.liveShotIDs.contains(uniqueID) {
+                // 实况照片：缓存静态数据（注入 GPS），等视频回调后配对保存
+                self.pendingLiveStills[uniqueID] = self.photoDataInjectingGPS(savedData)
+                self.tryFlushLivePhoto(uniqueID: uniqueID)
+            } else {
+                // RAW 数据不注入 GPS（DNG 格式注入风险高），普通照片注入
+                let finalData = isRaw ? savedData : self.photoDataInjectingGPS(savedData)
+                self.saveToPhotosLibrary(data: finalData)
+            }
             // 轻触反馈：自动拍照时也能感知已拍摄
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
+
+    nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
+                                 didFinishProcessingLivePhotoToMovieFileAt movieFileURL: URL,
+                                 duration: CMTime,
+                                 photoDisplayTime: CMTime,
+                                 resolvedSettings: AVCaptureResolvedPhotoSettings,
+                                 error: Error?) {
+        guard error == nil else {
+            Task { @MainActor in
+                self.errorMessage = "实况视频录制失败：\(error?.localizedDescription ?? "未知错误")"
+                self.liveShotIDs.remove(resolvedSettings.uniqueID)
+                self.pendingLiveStills.removeValue(forKey: resolvedSettings.uniqueID)
+            }
+            try? FileManager.default.removeItem(at: movieFileURL)
+            return
+        }
+        let uniqueID = resolvedSettings.uniqueID
+        Task { @MainActor in
+            self.pendingLiveMovies[uniqueID] = movieFileURL
+            self.tryFlushLivePhoto(uniqueID: uniqueID)
+        }
+    }
+
+    /// 静态照片 + 视频都到位后，配对保存为实况照片
+    private func tryFlushLivePhoto(uniqueID: Int64) {
+        guard let still = pendingLiveStills[uniqueID],
+              let movie = pendingLiveMovies[uniqueID] else { return }
+        pendingLiveStills.removeValue(forKey: uniqueID)
+        pendingLiveMovies.removeValue(forKey: uniqueID)
+        liveShotIDs.remove(uniqueID)
+        saveLivePhotoToLibrary(stillData: still, movieURL: movie)
+    }
+
+    private func saveLivePhotoToLibrary(stillData: Data, movieURL: URL) {
+        requestPhotoAddPermission { [weak self] granted in
+            guard granted else {
+                Task { @MainActor in
+                    self?.errorMessage = "未获得相册写入权限，实况照片未保存。"
+                }
+                try? FileManager.default.removeItem(at: movieURL)
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, data: stillData, options: nil)
+                request.addResource(with: .pairedVideo, fileURL: movieURL, options: nil)
+            } completionHandler: { success, error in
+                if !success {
+                    Task { @MainActor in
+                        self?.errorMessage = "保存实况照片失败：\(error?.localizedDescription ?? "未知错误")"
+                    }
+                }
+                try? FileManager.default.removeItem(at: movieURL)
+            }
         }
     }
 
