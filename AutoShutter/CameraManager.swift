@@ -1,6 +1,5 @@
 import Foundation
 import AVFoundation
-import AudioToolbox
 import Photos
 import UIKit
 
@@ -78,8 +77,6 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var recordingTime: TimeInterval = 0
     /// 手电筒是否打开（视频模式）
     @Published var isTorchOn = false
-    /// 夜间模式是否开启（照片模式）
-    @Published var isNightMode = false
     /// 拍照音效是否静音
     @Published var isMuted = false
     /// 距离下一次自动拍照的剩余时间（秒，仅自动拍照运行时有效）
@@ -351,8 +348,6 @@ final class CameraManager: NSObject, ObservableObject,
                         self.isUsingFrontCamera.toggle()
                         if self.isUsingFrontCamera {
                             self.flash = .off
-                            // 夜间模式仅后置可用，切到前置时关闭
-                            self.isNightMode = false
                         }
                         self.setZoom(1.0)
                         self.exposureTargetBias = 0
@@ -596,56 +591,11 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
-    /// 切换夜间模式（照片模式）。
-    /// 开启：锁定 1/4s 长曝光 + 高 ISO + 低光增强（模拟原相机夜间模式效果）
-    /// 关闭：恢复标准连续自动曝光
-    func toggleNightMode() {
-        guard currentMode == .photo, !isUsingFrontCamera else { return }
-        let turnOn = !isNightMode
-        isNightMode = turnOn
-        // 在闭包外捕获设备引用，避免 Sendable 闭包访问 MainActor 隔离属性
-        let camera = self.currentCamera
-        sessionQueue.async { [weak self] in
-            guard let self, let camera = camera else { return }
-            do {
-                try camera.lockForConfiguration()
-                if turnOn {
-                    // 锁定长曝光（1/4 秒）+ 较高 ISO：暗光下显著更亮
-                    // 注：isLowLightBoostEnabled 在 iOS SDK 中为只读属性，无法手动写入，
-                    //     夜间模式效果完全由下方自定义曝光实现。
-                    if camera.isExposureModeSupported(.custom) {
-                        let nightDuration = CMTime(seconds: 1.0 / 4.0, preferredTimescale: 600)
-                        let nightISO = min(camera.activeFormat.maxISO, 2500)
-                        camera.setExposureModeCustom(duration: nightDuration,
-                                                     iso: nightISO,
-                                                     completionHandler: nil)
-                        print("[Camera] 夜间模式：锁定曝光 1/4s, ISO \(Int(nightISO))")
-                    }
-                } else {
-                    // 关闭夜间模式：恢复标准自动曝光
-                    if camera.isExposureModeSupported(.continuousAutoExposure) {
-                        camera.exposureMode = .continuousAutoExposure
-                    }
-                    camera.setExposureTargetBias(0, completionHandler: nil)
-                }
-                camera.unlockForConfiguration()
-                Task { @MainActor in
-                    self.exposureTargetBias = 0
-                }
-                print("[Camera] 夜间模式 \(turnOn ? "开启" : "关闭")")
-            } catch {
-                print("切换夜间模式失败：\(error)")
-                Task { @MainActor in self.isNightMode = false }
-            }
-        }
-    }
-
     // MARK: - 拍照
 
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
-        playShutterSound()
 
         // 显式使用 HEIF/HEVC 编码（如果设备支持），否则回退到 JPEG
         let settings: AVCapturePhotoSettings
@@ -659,16 +609,14 @@ final class CameraManager: NSObject, ObservableObject,
         if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.quality.rawValue {
             settings.photoQualityPrioritization = .quality
         }
-        // 夜间模式：启用自动曝光 + 允许长曝光（iOS 自动多帧合成）
-        if isNightMode && !isUsingFrontCamera {
-            settings.isAutoStillImageStabilizationEnabled = true
-            print("[Camera] 夜间模式拍照：启用自动曝光 + 图像稳定")
+        // 静音时抑制系统内置快门音效（iOS 18+ 官方 API）。
+        // 拍照时系统会自动播放快门声（隐私政策），此开关将其关闭；
+        // 部分地区（如日/韩）法律要求快门声不可关闭，此时 isShutterSoundSuppressionSupported 为 false。
+        if isMuted, photoOutput.isShutterSoundSuppressionSupported {
+            settings.isShutterSoundSuppressionEnabled = true
         }
-        // 闪光灯（前置摄像头无闪光灯；夜间模式下自动关闭闪光灯）
+        // 闪光灯（前置摄像头无闪光灯）
         if isUsingFrontCamera {
-            settings.flashMode = .off
-        } else if isNightMode {
-            // 夜间模式下禁用闪光灯（避免破坏夜景氛围）
             settings.flashMode = .off
         } else {
             switch flash {
@@ -691,13 +639,6 @@ final class CameraManager: NSObject, ObservableObject,
             connection.videoOrientation = .portrait
         }
         photoOutput.capturePhoto(with: settings, delegate: self)
-    }
-
-    /// 播放快门音效（受 isMuted 控制）。
-    /// 1108 为 iOS 系统相机快门音效 ID（公开可用的系统音效）。
-    private func playShutterSound() {
-        guard !isMuted else { return }
-        AudioServicesPlaySystemSound(1108)
     }
 
     // MARK: - 视频录制

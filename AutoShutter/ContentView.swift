@@ -82,7 +82,7 @@ struct ContentView: View {
                         }
 
                         // 水平仪（俯拍姿态时自动出现，十字对齐后变黄）
-                        if cameraManager.currentMode == .photo, levelMonitor.isNearFlat {
+                        if levelMonitor.isNearFlat {
                             LevelIndicatorView(offset: levelMonitor.tiltOffset,
                                                isLevel: levelMonitor.isLevel)
                         }
@@ -183,19 +183,6 @@ struct ContentView: View {
             }
             .disabled(cameraManager.isUsingFrontCamera && cameraManager.currentMode == .photo)
 
-            // 夜间模式按钮（仅在照片模式 + 后置摄像头时可用）
-            Button {
-                cameraManager.toggleNightMode()
-                haptic(.light)
-            } label: {
-                Image(systemName: nightModeIconName)
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(nightModeColor)
-                    .frame(width: 40, height: 40)
-            }
-            .disabled(cameraManager.isUsingFrontCamera || cameraManager.currentMode != .photo)
-            .opacity(cameraManager.isUsingFrontCamera || cameraManager.currentMode != .photo ? 0.3 : 1.0)
-
             // 网格线开关
             Button {
                 withAnimation(.easeInOut(duration: 0.15)) { showGrid.toggle() }
@@ -259,14 +246,6 @@ struct ContentView: View {
             return cameraManager.isTorchOn ? "bolt.fill" : "bolt.slash"
         }
         return cameraManager.flash.iconName
-    }
-
-    private var nightModeIconName: String {
-        cameraManager.isNightMode ? "moon.fill" : "moon"
-    }
-
-    private var nightModeColor: Color {
-        cameraManager.isNightMode ? .yellow : .white
     }
 
     private var recordingTimeText: String {
@@ -887,8 +866,9 @@ final class LevelMonitor: ObservableObject {
     private let maxOffset: CGFloat = 60
     /// 判定水平的重力分量阈值（约 ±2.5°）
     private let levelThreshold: Double = 0.045
-    /// 判定接近俯拍姿态的 z 分量阈值（屏幕朝上时 gravity.z ≈ -1）
-    private let flatThreshold: Double = -0.85
+    /// 判定接近俯拍姿态的 z 分量阈值（屏幕朝上时 gravity.z ≈ -1）。
+    /// -0.7 表示偏离水平面约 45° 以内即显示水平仪，避免用户觉得"没有出现"
+    private let flatThreshold: Double = -0.7
     /// 是否已触发过水平触觉反馈（避免连续震动）
     private var levelHapticFired = false
 
