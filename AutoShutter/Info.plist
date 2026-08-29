@@ -6,6 +6,8 @@
 	<string>AutoShutter 需要使用相机来预览画面并自动拍照。请允许访问以使用自动定时拍摄功能。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>AutoShutter 需要将拍摄的照片保存到您的相册中。请允许访问以便照片自动保存。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>拍刻 会在拍摄的照片中记录拍摄地点（GPS），便于在相册地图中查看。请允许访问以使用此功能。</string>
 	<key>CFBundleName</key>
 	<string>AutoShutter</string>
 	<key>CFBundleDisplayName</key>

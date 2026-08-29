@@ -2,6 +2,8 @@ import Foundation
 import AVFoundation
 import Photos
 import UIKit
+import CoreLocation
+import ImageIO
 
 // MARK: - 相机模式
 
@@ -41,6 +43,16 @@ enum FlashSetting: Int, CaseIterable {
     }
 }
 
+// MARK: - 定位状态
+
+/// 照片地理位置记录状态（用于顶栏指示器）
+enum LocationStatus {
+    case unknown      // 未请求过
+    case searching    // 已授权但还没拿到有效定位
+    case ready        // 已拿到有效定位，照片会写入 GPS
+    case denied       // 被拒绝/受限
+}
+
 // MARK: - 相机管理器
 
 /// 相机管理器：负责 AVCaptureSession 的配置与运行，
@@ -49,7 +61,8 @@ enum FlashSetting: Int, CaseIterable {
 @MainActor
 final class CameraManager: NSObject, ObservableObject,
                            AVCapturePhotoCaptureDelegate,
-                           AVCaptureFileOutputRecordingDelegate {
+                           AVCaptureFileOutputRecordingDelegate,
+                           CLLocationManagerDelegate {
 
     // MARK: - 暴露给 UI 的状态
 
@@ -81,6 +94,8 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var isMuted = false
     /// 距离下一次自动拍照的剩余时间（秒，仅自动拍照运行时有效）
     @Published var secondsUntilNextCapture: Double = 0
+    /// 照片地理位置记录状态
+    @Published var locationStatus: LocationStatus = .unknown
 
     // MARK: - 内部属性
 
@@ -96,6 +111,12 @@ final class CameraManager: NSObject, ObservableObject,
     /// 倒计时刷新定时器
     private var countdownTimer: Timer?
     private let sessionQueue = DispatchQueue(label: "com.autoshutter.session")
+
+    // MARK: - 定位（照片 GPS 写入）
+
+    private let locationManager = CLLocationManager()
+    /// 最近一次有效定位（写入照片 EXIF GPS）
+    private var latestLocation: CLLocation?
 
     /// 镜头切换是否进行中（防止捏合手势连续触发重复切换导致 session 状态混乱）
     private var isSwitchingLens = false
@@ -119,6 +140,7 @@ final class CameraManager: NSObject, ObservableObject,
 
     /// 请求相机权限并配置会话
     func requestPermissionAndConfigure() {
+        setupLocation()
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
         case .authorized:
@@ -786,6 +808,112 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
+    // MARK: - 定位（照片 GPS 写入）
+
+    /// 初始化定位：申请 When In Use 权限，已授权则开始更新
+    private func setupLocation() {
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        let status = locationManager.authorizationStatus
+        if status == .notDetermined {
+            locationManager.requestWhenInUseAuthorization()
+        } else {
+            applyLocationStatus(status)
+        }
+    }
+
+    /// 根据授权状态更新 locationStatus 并启停更新
+    private func applyLocationStatus(_ status: CLAuthorizationStatus) {
+        switch status {
+        case .authorizedWhenInUse, .authorizedAlways:
+            locationStatus = (latestLocation == nil) ? .searching : .ready
+            locationManager.startUpdatingLocation()
+        case .denied, .restricted:
+            locationStatus = .denied
+            locationManager.stopUpdatingLocation()
+        case .notDetermined:
+            locationStatus = .unknown
+        @unknown default:
+            locationStatus = .unknown
+        }
+    }
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        Task { @MainActor in
+            self.applyLocationStatus(status)
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager,
+                                     didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        let ts = loc.timestamp.timeIntervalSinceNow
+        let acc = loc.horizontalAccuracy
+        Task { @MainActor in
+            // 过滤过期或无效定位（负精度表示无效）
+            if ts > -10 && acc >= 0 {
+                self.latestLocation = loc
+                self.locationStatus = .ready
+            }
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager,
+                                     didFailWithError error: Error) {
+        Task { @MainActor in
+            print("[Location] 失败：\(error)")
+        }
+    }
+
+    /// 由 CLLocation 生成 EXIF GPS 字典
+    private func gpsDictionary(for location: CLLocation) -> [CFString: Any] {
+        let coord = location.coordinate
+        var dict: [CFString: Any] = [
+            kCGImagePropertyGPSLatitude: abs(coord.latitude),
+            kCGImagePropertyGPSLatitudeRef: coord.latitude >= 0 ? "N" : "S",
+            kCGImagePropertyGPSLongitude: abs(coord.longitude),
+            kCGImagePropertyGPSLongitudeRef: coord.longitude >= 0 ? "E" : "W"
+        ]
+        if location.horizontalAccuracy >= 0 {
+            dict[kCGImagePropertyGPSDOP] = location.horizontalAccuracy
+            dict[kCGImagePropertyGPSHPositioningError] = location.horizontalAccuracy
+        }
+        if !location.altitude.isNaN {
+            dict[kCGImagePropertyGPSAltitude] = abs(location.altitude)
+            dict[kCGImagePropertyGPSAltitudeRef] = location.altitude < 0 ? 1 : 0
+        }
+        // 时间戳（UTC）
+        let f = DateFormatter()
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "HH:mm:ss.SSS"
+        dict[kCGImagePropertyGPSTimeStamp] = f.string(from: location.timestamp)
+        f.dateFormat = "yyyy:MM:dd"
+        dict[kCGImagePropertyGPSDateStamp] = f.string(from: location.timestamp)
+        return dict
+    }
+
+    /// 将 GPS EXIF 注入照片数据（HEIF/JPEG），无定位或注入失败时返回原数据
+    private func photoDataInjectingGPS(_ data: Data) -> Data {
+        guard let location = latestLocation,
+              location.timestamp.timeIntervalSinceNow > -300 else {
+            return data
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source) else {
+            return data
+        }
+        let mutableData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(mutableData, type, 1, nil) else {
+            return data
+        }
+        var props = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]) ?? [:]
+        props[kCGImagePropertyGPSDictionary] = gpsDictionary(for: location) as Any
+        CGImageDestinationAddImageFromSource(dest, source, 0, props as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return data }
+        return mutableData as Data
+    }
+
     // MARK: - AVCapturePhotoCaptureDelegate
 
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
@@ -803,7 +931,9 @@ final class CameraManager: NSObject, ObservableObject,
         Task { @MainActor in
             self.captureCount += 1
             self.onPhotoCaptured?(image)
-            self.saveToPhotosLibrary(data: data)
+            // 写入 GPS 后再保存到相册
+            let finalData = self.photoDataInjectingGPS(data)
+            self.saveToPhotosLibrary(data: finalData)
             // 轻触反馈：自动拍照时也能感知已拍摄
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
@@ -840,5 +970,6 @@ final class CameraManager: NSObject, ObservableObject,
         if session.isRunning {
             session.stopRunning()
         }
+        locationManager.stopUpdatingLocation()
     }
 }

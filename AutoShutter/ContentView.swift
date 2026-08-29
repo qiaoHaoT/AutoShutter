@@ -207,6 +207,21 @@ struct ContentView: View {
                     .frame(width: 40, height: 40)
             }
 
+            // 定位状态指示（黄=已记录位置，白=等待定位，灰=未授权；点按可跳设置）
+            Button {
+                if cameraManager.locationStatus == .denied {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                haptic(.light)
+            } label: {
+                Image(systemName: locationIconName)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(locationIconColor)
+                    .frame(width: 40, height: 40)
+            }
+
             Spacer()
 
             // 视频录制指示
@@ -253,6 +268,24 @@ struct ContentView: View {
     private var recordingTimeText: String {
         let seconds = Int(cameraManager.recordingTime)
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private var locationIconName: String {
+        switch cameraManager.locationStatus {
+        case .ready:     return "location.fill"
+        case .searching: return "location"
+        case .denied:    return "location.slash"
+        case .unknown:   return "location.slash"
+        }
+    }
+
+    private var locationIconColor: Color {
+        switch cameraManager.locationStatus {
+        case .ready:     return .yellow
+        case .searching: return .white
+        case .denied:    return .white.opacity(0.4)
+        case .unknown:   return .white.opacity(0.4)
+        }
     }
 
     // MARK: - 自动拍照浮动面板
