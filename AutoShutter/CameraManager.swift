@@ -304,6 +304,12 @@ final class CameraManager: NSObject, ObservableObject,
                 if self.photoOutput.isLivePhotoCaptureSupported {
                     self.photoOutput.isLivePhotoCaptureEnabled = true
                 }
+                // Apple ProRAW：会话配置时即启用。该开关仅「允许」输出 RAW，不改变普通拍照；
+                // 必须在 capturePhoto 前启用，否则带 rawPixelFormatType 的拍摄设置会触发
+                // NSInvalidArgumentException 闪退。运行中切换会重配置 pipeline，故一次性常开。
+                if self.photoOutput.isAppleProRAWSupported {
+                    self.photoOutput.isAppleProRAWEnabled = true
+                }
             }
 
             // 4. 视频输出

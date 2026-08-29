@@ -221,6 +221,26 @@ struct ContentView: View {
                     .frame(width: 40, height: 40)
             }
 
+            // Apple ProRAW 开关（仅照片模式且设备支持；与实况互斥）
+            if cameraManager.currentMode == .photo && cameraManager.isRawSupported {
+                Button {
+                    cameraManager.toggleRaw()
+                    haptic(.light)
+                } label: {
+                    Text("RAW")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(cameraManager.isRawEnabled ? .black : .white.opacity(0.85))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(
+                            cameraManager.isRawEnabled ? Color.yellow : Color.white.opacity(0.18),
+                            in: Capsule()
+                        )
+                }
+                .disabled(cameraManager.isLivePhotoEnabled)
+                .opacity(cameraManager.isLivePhotoEnabled ? 0.4 : 1)
+            }
+
             Spacer()
 
             // 视频录制指示
@@ -436,9 +456,9 @@ struct ContentView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 0) {
-            // 0. 实况 / RAW 切换（仅照片模式且设备支持时显示）
+            // 0. 实况照片切换（仅照片模式且设备支持时显示；RAW 在顶部栏）
             if cameraManager.currentMode == .photo
-                && (cameraManager.isLivePhotoSupported || cameraManager.isRawSupported) {
+                && cameraManager.isLivePhotoSupported {
                 captureFormatBar
                     .padding(.bottom, 10)
             }
@@ -465,9 +485,9 @@ struct ContentView: View {
         .padding(.horizontal, 0)
     }
 
-    // MARK: - 实况 / RAW 切换栏
+    // MARK: - 实况照片切换栏
 
-    /// 实况照片与 Apple ProRAW 切换（仅照片模式）
+    /// 实况照片切换（仅照片模式；RAW 开关已移至顶部栏）
     private var captureFormatBar: some View {
         HStack(spacing: 28) {
             if cameraManager.isLivePhotoSupported {
@@ -492,26 +512,8 @@ struct ContentView: View {
                 .disabled(cameraManager.isRawEnabled)
                 .opacity(cameraManager.isRawEnabled ? 0.4 : 1)
             }
-
-            if cameraManager.isRawSupported {
-                Button {
-                    cameraManager.toggleRaw()
-                    haptic(.light)
-                } label: {
-                    Text("RAW")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(cameraManager.isRawEnabled ? .black : .white.opacity(0.85))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
-                        .background(
-                            cameraManager.isRawEnabled ? Color.yellow : Color.white.opacity(0.18),
-                            in: Capsule()
-                        )
-                }
-            }
         }
         .animation(.easeInOut(duration: 0.15), value: cameraManager.isLivePhotoEnabled)
-        .animation(.easeInOut(duration: 0.15), value: cameraManager.isRawEnabled)
     }
 
     /// 变焦预设按钮组（原相机风格）
