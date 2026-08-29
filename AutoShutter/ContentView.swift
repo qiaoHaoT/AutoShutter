@@ -826,7 +826,7 @@ private struct LevelIndicatorView: View {
             // 固定虚线（水平参考，对齐时淡出）
             VerticalLineShape()
                 .stroke(.white.opacity(isLevel ? 0 : 0.75),
-                        style: StrokeStyle(lineWidth: 2, dash: [4, 5], lineCap: .round))
+                        style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [4, 5]))
                 .frame(width: 2, height: 70)
                 .animation(.easeOut(duration: 0.15), value: isLevel)
 
