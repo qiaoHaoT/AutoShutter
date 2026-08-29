@@ -81,10 +81,12 @@ struct ContentView: View {
                             GridView()
                         }
 
-                        // 水平仪（俯拍姿态时自动出现，十字对齐后变黄）
-                        if levelMonitor.isNearFlat {
+                        // 水平仪（iPhone 原相机水平模式：手机竖立时显示两条竖线，对齐变黄）
+                        if levelMonitor.isUpright {
                             LevelIndicatorView(offset: levelMonitor.tiltOffset,
+                                               rotationAngle: levelMonitor.rotationAngle,
                                                isLevel: levelMonitor.isLevel)
+                                .transition(.opacity)
                         }
 
                         // 对焦框 + 小太阳（仅在预览区域内）
@@ -806,40 +808,47 @@ private struct GridView: View {
     }
 }
 
-// MARK: - 水平仪（俯拍十字）
+// MARK: - 水平仪（iPhone 原相机水平模式）
 
-/// 十字水平仪：中心固定十字 + 随倾斜移动的小十字，对齐后变黄（对齐 iPhone 原相机俯拍水平仪）
+/// iPhone 原相机"水平"模式水平仪：
+/// - 中心固定一条**短虚线**作为水平参考
+/// - 一条**长实线**根据手机 roll 偏移 + 旋转，对齐时变黄（与 iOS 原相机一致）
 private struct LevelIndicatorView: View {
-    /// 移动十字相对中心的偏移（pt）
+    /// 实线中心相对屏幕中心的偏移（pt）
     let offset: CGSize
+    /// 实线旋转角度（度，SwiftUI 顺时针为正）
+    let rotationAngle: Double
     /// 是否已对齐水平
     let isLevel: Bool
 
     var body: some View {
         ZStack {
-            // 固定十字（中心基准）
-            CrossShape()
-                .stroke(.white.opacity(0.9), lineWidth: 1.5)
-                .frame(width: 32, height: 32)
+            // 固定虚线（水平参考，对齐时淡出）
+            VerticalLineShape()
+                .stroke(.white.opacity(isLevel ? 0 : 0.75),
+                        style: StrokeStyle(lineWidth: 2, dash: [4, 5], lineCap: .round))
+                .frame(width: 2, height: 70)
+                .animation(.easeOut(duration: 0.15), value: isLevel)
 
-            // 移动十字（随倾斜移动）
-            CrossShape()
-                .stroke(isLevel ? .yellow : .white.opacity(0.85), lineWidth: 2.5)
-                .frame(width: 22, height: 22)
+            // 移动实线（随倾斜偏移 + 旋转，对齐时变黄）
+            VerticalLineShape()
+                .stroke(isLevel ? .yellow : .white, lineWidth: 2.5)
+                .frame(width: 2, height: 320)
+                .rotationEffect(.degrees(rotationAngle))
                 .offset(offset)
+                .shadow(color: isLevel ? .yellow.opacity(0.4) : .clear, radius: 4)
                 .animation(.easeOut(duration: 0.08), value: offset)
+                .animation(.easeOut(duration: 0.08), value: rotationAngle)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 }
 
-/// 十字形状（一横一竖两条线）
-private struct CrossShape: Shape {
+/// 竖直一条线 Shape（frame 多大线就多长）
+private struct VerticalLineShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        path.move(to: CGPoint(x: rect.minX, y: rect.midY))
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
         path.move(to: CGPoint(x: rect.midX, y: rect.minY))
         path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
         return path
@@ -848,27 +857,32 @@ private struct CrossShape: Shape {
 
 // MARK: - 水平仪姿态监测
 
-/// 监测设备姿态：俯拍姿态（屏幕朝上、镜头朝下）时提供十字水平仪数据。
-/// - tiltOffset：移动十字相对中心的偏移（pt），由重力在屏幕平面的投影换算
-/// - isNearFlat：接近俯拍姿态（此时才显示水平仪）
-/// - isLevel：已对齐水平（十字重合，UI 变黄并触发一次触觉反馈）
+/// 监测设备姿态，驱动 iPhone 原相机"水平"模式水平仪。
+/// - isUpright：手机大致竖立（gy < -0.7 且 |gz| < 0.4），满足时才显示水平仪
+/// - tiltOffset：实线相对屏幕中心的偏移（pt），由 roll（gravity.x）换算
+/// - rotationAngle：实线旋转角度（度，顺时针为正）
+/// - isLevel：已对齐水平（roll ≈ 0），UI 变黄并触发一次触觉反馈
 @MainActor
 final class LevelMonitor: ObservableObject {
 
     @Published var tiltOffset: CGSize = .zero
-    @Published var isNearFlat = false
+    @Published var rotationAngle: Double = 0
+    @Published var isUpright = false
     @Published var isLevel = false
 
     private let motion = CMMotionManager()
-    /// 重力投影 → 屏幕 pt 的换算系数
-    private let offsetScale: CGFloat = 300
-    /// 十字最大偏移（pt）
-    private let maxOffset: CGFloat = 60
-    /// 判定水平的重力分量阈值（约 ±2.5°）
-    private let levelThreshold: Double = 0.045
-    /// 判定接近俯拍姿态的 z 分量阈值（屏幕朝上时 gravity.z ≈ -1）。
-    /// -0.7 表示偏离水平面约 45° 以内即显示水平仪，避免用户觉得"没有出现"
-    private let flatThreshold: Double = -0.7
+    /// 重力 → 屏幕 pt 偏移换算系数
+    private let offsetScale: CGFloat = 280
+    /// 偏移上限（pt）
+    private let maxOffset: CGFloat = 120
+    /// 重力 → 旋转角度换算系数（度）
+    private let rotationScale: Double = 35
+    /// 判定水平的重力 x 阈值（约 ±1.5°）
+    private let levelThreshold: Double = 0.025
+    /// 判定手机竖立的 gy 阈值（屏幕朝上时 gy ≈ -1，< -0.7 ≈ 偏离 ±45° 内）
+    private let uprightGYThreshold: Double = -0.7
+    /// 判定手机竖立的 |gz| 阈值（屏幕不能太朝前/后）
+    private let uprightGZThreshold: Double = 0.4
     /// 是否已触发过水平触觉反馈（避免连续震动）
     private var levelHapticFired = false
 
@@ -891,20 +905,26 @@ final class LevelMonitor: ObservableObject {
     }
 
     private func handleGravity(x: Double, y: Double, z: Double) {
-        // 屏幕朝上（俯拍）：gravity.z ≈ -1
-        let nearFlat = z < flatThreshold
-        isNearFlat = nearFlat
-        guard nearFlat else {
+        // 竖立判定：手机竖立、屏幕大致朝前/后（不朝上/下）
+        let upright = y < uprightGYThreshold && abs(z) < uprightGZThreshold
+        isUpright = upright
+        guard upright else {
+            tiltOffset = .zero
+            rotationAngle = 0
             isLevel = false
             levelHapticFired = false
             return
         }
-        // 右倾（gravity.x > 0）→ 十字向右；上端下沉（gravity.y > 0）→ 十字向上
+        // 偏移：右倾（gravity.x > 0）→ 实线向右偏移，模拟原相机的"重力摆"效果
         let dx = CGFloat(x) * offsetScale
-        let dy = CGFloat(-y) * offsetScale
-        tiltOffset = CGSize(width: min(max(dx, -maxOffset), maxOffset),
-                            height: min(max(dy, -maxOffset), maxOffset))
-        let leveled = abs(x) < levelThreshold && abs(y) < levelThreshold
+        tiltOffset = CGSize(
+            width: min(max(dx, -maxOffset), maxOffset),
+            height: 0
+        )
+        // 旋转：与偏移同向（小角度近似），使实线倾斜显示当前姿态
+        rotationAngle = x * rotationScale
+        // 水平判定
+        let leveled = abs(x) < levelThreshold
         isLevel = leveled
         if leveled, !levelHapticFired {
             levelHapticFired = true
