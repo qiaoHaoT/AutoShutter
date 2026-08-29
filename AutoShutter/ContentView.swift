@@ -858,10 +858,10 @@ private struct VerticalLineShape: Shape {
 // MARK: - 水平仪姿态监测
 
 /// 监测设备姿态，驱动 iPhone 原相机"水平"模式水平仪。
-/// - isUpright：手机大致竖立（gy < -0.7 且 |gz| < 0.4），满足时才显示水平仪
-/// - tiltOffset：实线相对屏幕中心的偏移（pt），由 roll（gravity.x）换算
+/// - isUpright：手机处于竖握 / 横握（含倒立）任一姿态，且屏幕大致朝前/后（非俯拍/仰拍）
+/// - tiltOffset：实线相对屏幕中心的偏移（pt），由相对水平姿态的 roll 换算
 /// - rotationAngle：实线旋转角度（度，顺时针为正）
-/// - isLevel：已对齐水平（roll ≈ 0），UI 变黄并触发一次触觉反馈
+/// - isLevel：已对齐水平（相对 roll ≈ 0），UI 变黄并触发一次触觉反馈
 @MainActor
 final class LevelMonitor: ObservableObject {
 
@@ -877,11 +877,9 @@ final class LevelMonitor: ObservableObject {
     private let maxOffset: CGFloat = 120
     /// 重力 → 旋转角度换算系数（度）
     private let rotationScale: Double = 35
-    /// 判定水平的重力 x 阈值（约 ±1.5°）
-    private let levelThreshold: Double = 0.025
-    /// 判定手机竖立的 gy 阈值（屏幕朝上时 gy ≈ -1，< -0.7 ≈ 偏离 ±45° 内）
-    private let uprightGYThreshold: Double = -0.7
-    /// 判定手机竖立的 |gz| 阈值（屏幕不能太朝前/后）
+    /// 判定水平的 roll 角阈值（度）
+    private let levelDegreeThreshold: Double = 1.5
+    /// 显示阈值：|gravity.z| 超过此值视为俯拍/仰拍，隐藏水平仪
     private let uprightGZThreshold: Double = 0.4
     /// 是否已触发过水平触觉反馈（避免连续震动）
     private var levelHapticFired = false
@@ -905,26 +903,34 @@ final class LevelMonitor: ObservableObject {
     }
 
     private func handleGravity(x: Double, y: Double, z: Double) {
-        // 竖立判定：手机竖立、屏幕大致朝前/后（不朝上/下）
-        let upright = y < uprightGYThreshold && abs(z) < uprightGZThreshold
-        isUpright = upright
-        guard upright else {
+        // 显示判定：只看屏幕朝向（大致朝前/后即可），竖握 / 横握 / 倒立都显示
+        let active = abs(z) < uprightGZThreshold
+        isUpright = active
+        guard active else {
             tiltOffset = .zero
             rotationAngle = 0
             isLevel = false
             levelHapticFired = false
             return
         }
-        // 偏移：右倾（gravity.x > 0）→ 实线向右偏移，模拟原相机的"重力摆"效果
-        let dx = CGFloat(x) * offsetScale
+        // 姿态角（portrait 基准 0°）：竖握水平 0°，横握 ±90°，倒立 180°
+        let theta = atan2(x, -y) * 180.0 / .pi
+        // 取最近的标准姿态（0° / ±90° / 180°）作为"水平"基准，
+        // 使竖握与横握都能以各自基准判定水平
+        let baseline = (theta / 90.0).rounded() * 90.0
+        // 相对基准的 roll 偏差（度，∈ [-45°, 45°]），再换算为等效重力分量
+        let rollDeg = theta - baseline
+        let gxEquivalent = sin(rollDeg * .pi / 180.0)
+        // 偏移：右倾 → 实线向右偏移，模拟原相机的"重力摆"效果
+        let dx = CGFloat(gxEquivalent) * offsetScale
         tiltOffset = CGSize(
             width: min(max(dx, -maxOffset), maxOffset),
             height: 0
         )
         // 旋转：与偏移同向（小角度近似），使实线倾斜显示当前姿态
-        rotationAngle = x * rotationScale
+        rotationAngle = gxEquivalent * rotationScale
         // 水平判定
-        let leveled = abs(x) < levelThreshold
+        let leveled = abs(rollDeg) < levelDegreeThreshold
         isLevel = leveled
         if leveled, !levelHapticFired {
             levelHapticFired = true
