@@ -317,12 +317,13 @@ final class CameraManager: NSObject, ObservableObject,
                 }
             }
 
-            // 4. 视频输出
-            if self.session.canAddOutput(self.movieOutput) {
-                self.session.addOutput(self.movieOutput)
-            }
-
             self.session.commitConfiguration()
+
+            // 4. 视频输出：**不在照片模式添加**。
+            // Apple 官方文档明确：session 包含 AVCaptureMovieFileOutput 时，
+            // isLivePhotoCaptureSupported 会变 false，实况照片不可用。
+            // 只在切到视频模式时才添加（见 setMode），切回照片时移除。
+            // （movieOutput 对象本身保留，仅不在 photo 模式接入 session）
 
             // 5. 回到主线程：记录设备状态、配置默认参数并启动会话
             Task { @MainActor in
@@ -334,15 +335,11 @@ final class CameraManager: NSObject, ObservableObject,
                 self.isSessionRunning = self.session.isRunning
                 // 会话启动后实况支持状态才可靠，刷新以驱动 UI 显示开关
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
-                CrashReporter.trace("configureSession 完成 liveSupported=\(self.isLivePhotoSupported) rawSupported=\(self.photoOutput.isAppleProRAWSupported)")
+                CrashReporter.trace("configureSession 完成 rawOn=\(rawOn) liveSupported=\(self.isLivePhotoSupported) rawSupported=\(self.photoOutput.isAppleProRAWSupported)")
                 // startRunning() 是异步的，刚返回时 isLivePhotoCaptureSupported
-                // 可能仍为 false。延迟 0.5s 重试，确保属性翻转为 true 后能刷新 UI。
-                Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    guard let self else { return }
-                    let supported = self.photoOutput.isLivePhotoCaptureSupported
-                    self.isLivePhotoSupported = supported
-                    CrashReporter.trace("延迟刷新 isLivePhotoSupported=\(supported)")
+                // 可能仍为 false。ProRAW 关闭时需要轮询等待管线释放后支持恢复。
+                if !rawOn {
+                    self.retryRefreshLiveSupport(attempt: 0)
                 }
                 // 调试：打印实际使用的设备信息
                 print("[Camera] 使用设备: \(camera.deviceType.rawValue), " +
@@ -372,9 +369,14 @@ final class CameraManager: NSObject, ObservableObject,
     // MARK: - 模式切换
 
     /// 切换相机模式（照片 / 视频）
+    /// 关键：视频模式才把 movieOutput 加入 session，照片模式移除——
+    /// 否则 isLivePhotoCaptureSupported 永远是 false（Apple 官方限制）。
     func setMode(_ mode: CameraMode) {
+        // 切到照片前先停录制
+        if mode == .photo, isRecording {
+            toggleRecording()
+        }
         currentMode = mode
-        // 在主线程捕获当前开关状态，供 sessionQueue 闭包恢复管线
         let rawOn = isRawEnabled
         let liveOn = isLivePhotoEnabled
         sessionQueue.async { [weak self] in
@@ -382,12 +384,20 @@ final class CameraManager: NSObject, ObservableObject,
             self.session.beginConfiguration()
             if mode == .photo {
                 self.session.sessionPreset = .photo
+                // 移除 movieOutput，恢复实况照片支持
+                if self.session.outputs.contains(self.movieOutput) {
+                    self.session.removeOutput(self.movieOutput)
+                }
             } else {
                 self.session.sessionPreset = .high
+                // 视频模式才添加 movieOutput
+                if !self.session.outputs.contains(self.movieOutput),
+                   self.session.canAddOutput(self.movieOutput) {
+                    self.session.addOutput(self.movieOutput)
+                }
             }
             self.session.commitConfiguration()
-            // preset 切换会重置 photoOutput 管线状态，按当前开关恢复
-            // （ProRAW 与实况互斥，顺序：先 ProRAW，再实况）
+            // preset / output 切换后实况支持状态可能变化，刷新
             if mode == .photo {
                 if self.photoOutput.isAppleProRAWSupported {
                     self.photoOutput.isAppleProRAWEnabled = rawOn
@@ -396,9 +406,9 @@ final class CameraManager: NSObject, ObservableObject,
                     self.photoOutput.isLivePhotoCaptureEnabled = true
                 }
             }
-            // 切换 preset 后实况支持状态可能变化，刷新
             Task { @MainActor in
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
+                CrashReporter.trace("setMode=\(mode.rawValue) liveSupported=\(self.isLivePhotoSupported)")
             }
         }
     }
@@ -683,7 +693,8 @@ final class CameraManager: NSObject, ObservableObject,
 
     /// 切换实况照片开关
     /// ProRAW 与实况在 AVCapturePhotoOutput 层互斥：开启实况前必须先把
-    /// isAppleProRAWEnabled 关掉，否则 isLivePhotoCaptureSupported 一直是 false。
+    /// isAppleProRAWEnabled 关掉。但 pipeline 重配置是异步的——commitConfiguration()
+    /// 返回后 isLivePhotoCaptureSupported 不会立刻翻成 true，需要轮询等待。
     func toggleLivePhoto() {
         // 关闭实况：直接翻状态即可，无需动管线
         if isLivePhotoEnabled {
@@ -699,22 +710,41 @@ final class CameraManager: NSObject, ObservableObject,
             if self.photoOutput.isAppleProRAWSupported {
                 self.photoOutput.isAppleProRAWEnabled = false
             }
-            if self.photoOutput.isLivePhotoCaptureSupported {
-                self.photoOutput.isLivePhotoCaptureEnabled = true
-            }
             self.session.commitConfiguration()
-            // 在 sessionQueue 上读取管线切换后的真实支持状态，再回主线程
-            let supported = self.photoOutput.isLivePhotoCaptureSupported
-            let enabled = self.photoOutput.isLivePhotoCaptureEnabled
+            // pipeline 重配是异步的，isLivePhotoCaptureSupported 不会立刻变 true
+            self.retryEnableLivePhoto(attempt: 0)
+        }
+    }
+
+    /// 轮询等待 ProRAW 管线释放后 isLivePhotoCaptureSupported 翻转为 true，
+    /// 然后启用实况采集并回主线程更新 UI。最多重试 10 次（共 ~2 秒）。
+    private func retryEnableLivePhoto(attempt: Int) {
+        let supported = photoOutput.isLivePhotoCaptureSupported
+        if supported {
+            photoOutput.isLivePhotoCaptureEnabled = true
+            let enabled = photoOutput.isLivePhotoCaptureEnabled
             Task { @MainActor in
                 self.isLivePhotoSupported = supported
-                if supported, enabled {
+                if enabled {
                     self.isLivePhotoEnabled = true
-                    CrashReporter.trace("实况已开启 liveSupported=true liveEnabled=true")
+                    CrashReporter.trace("实况已开启 (attempt=\(attempt)) liveSupported=true")
                 } else {
-                    self.errorMessage = "此设备不支持实况照片。"
-                    CrashReporter.trace("实况开启失败 liveSupported=\(supported) liveEnabled=\(enabled)")
+                    self.errorMessage = "实况管线启用失败。"
+                    CrashReporter.trace("实况 enable 失败 (attempt=\(attempt))")
                 }
+            }
+            return
+        }
+        if attempt < 10 {
+            sessionQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.retryEnableLivePhoto(attempt: attempt + 1)
+            }
+        } else {
+            // 重试耗尽：确实不支持（可能是设备限制或管线卡住）
+            Task { @MainActor in
+                self.isLivePhotoSupported = false
+                self.errorMessage = "此设备不支持实况照片。（ProRAW 管线释放超时）"
+                CrashReporter.trace("实况开启失败 (10次重试后) liveSupported=false proRAWEnabled=\(self.photoOutput.isAppleProRAWEnabled)")
             }
         }
     }
@@ -738,9 +768,36 @@ final class CameraManager: NSObject, ObservableObject,
             self.session.beginConfiguration()
             self.photoOutput.isAppleProRAWEnabled = rawOn
             self.session.commitConfiguration()
+            // 关 RAW 时 pipeline 释放后实况支持恢复（异步），轮询刷新
+            if !rawOn {
+                self.retryRefreshLiveSupport(attempt: 0)
+            } else {
+                Task { @MainActor in
+                    self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
+                    CrashReporter.trace("toggleRaw raw=\(rawOn) ProRAW=\(self.photoOutput.isAppleProRAWEnabled) liveSupported=\(self.isLivePhotoSupported)")
+                }
+            }
+        }
+    }
+
+    /// 轮询刷新 isLivePhotoSupported（ProRAW 关闭后管线释放是异步的）。
+    private func retryRefreshLiveSupport(attempt: Int) {
+        let supported = photoOutput.isLivePhotoCaptureSupported
+        if supported {
+            Task { @MainActor in
+                self.isLivePhotoSupported = true
+                CrashReporter.trace("实况支持恢复 (attempt=\(attempt))")
+            }
+            return
+        }
+        if attempt < 10 {
+            sessionQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.retryRefreshLiveSupport(attempt: attempt + 1)
+            }
+        } else {
             Task { @MainActor in
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
-                CrashReporter.trace("toggleRaw raw=\(rawOn) ProRAW=\(self.photoOutput.isAppleProRAWEnabled) liveSupported=\(self.isLivePhotoSupported)")
+                CrashReporter.trace("实况支持未恢复 (10次重试) proRAWEnabled=\(self.photoOutput.isAppleProRAWEnabled)")
             }
         }
     }
