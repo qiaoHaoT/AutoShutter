@@ -51,6 +51,9 @@ struct ContentView: View {
     // 崩溃日志（上次运行崩溃时弹出，便于无 Xcode 时定位）
     @State private var crashReportText: String?
 
+    // 实况照片 LIVE 标识圆点呼吸动画
+    @State private var livePulse = false
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -118,6 +121,12 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
+                    .overlay(alignment: .top) {
+                        if cameraManager.isLivePhotoEnabled {
+                            livePhotoBadge
+                                .padding(.top, 8)
+                        }
+                    }
 
                     // 4. 底部控制区
                     bottomControls
@@ -553,6 +562,26 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.15), value: cameraManager.isLivePhotoEnabled)
+    }
+
+    /// 实况照片开启时的顶部 LIVE 标识（对齐原相机风格：黄色圆点 + LIVE 文字）
+    private var livePhotoBadge: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(Color.yellow)
+                .frame(width: 7, height: 7)
+                .scaleEffect(livePulse ? 1.3 : 1.0)
+                .opacity(livePulse ? 0.6 : 1.0)
+                .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: livePulse)
+            Text("LIVE")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(.ultraThinMaterial, in: Capsule())
+        .onAppear { livePulse = true }
+        .onDisappear { livePulse = false }
     }
 
     /// 变焦预设按钮组（原相机风格）
