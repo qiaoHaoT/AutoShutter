@@ -290,8 +290,11 @@ struct ContentView: View {
                 .opacity(cameraManager.isLivePhotoEnabled ? 0.4 : 1)
             }
 
-            // 实况照片开关（仅照片模式且设备支持；与 RAW 互斥）
-            if cameraManager.currentMode == .photo && cameraManager.isLivePhotoSupported {
+            // 实况照片开关（仅照片模式；与 RAW 互斥）
+            // 不依赖 isLivePhotoSupported 守卫——该属性在 startRunning()
+            // 异步完成前可能为 false，会导致按钮永远不出现。改为始终显示，
+            // tap 时由 toggleLivePhoto() 真正校验设备支持。
+            if cameraManager.currentMode == .photo {
                 Button {
                     cameraManager.toggleLivePhoto()
                     haptic(.light)

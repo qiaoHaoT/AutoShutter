@@ -332,6 +332,15 @@ final class CameraManager: NSObject, ObservableObject,
                 // 会话启动后实况支持状态才可靠，刷新以驱动 UI 显示开关
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
                 CrashReporter.trace("configureSession 完成 liveSupported=\(self.isLivePhotoSupported) rawSupported=\(self.photoOutput.isAppleProRAWSupported)")
+                // startRunning() 是异步的，刚返回时 isLivePhotoCaptureSupported
+                // 可能仍为 false。延迟 0.5s 重试，确保属性翻转为 true 后能刷新 UI。
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    guard let self else { return }
+                    let supported = self.photoOutput.isLivePhotoCaptureSupported
+                    self.isLivePhotoSupported = supported
+                    CrashReporter.trace("延迟刷新 isLivePhotoSupported=\(supported)")
+                }
                 // 调试：打印实际使用的设备信息
                 print("[Camera] 使用设备: \(camera.deviceType.rawValue), " +
                       "镜头: \(camera.localizedName), " +
