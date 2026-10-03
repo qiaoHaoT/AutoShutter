@@ -290,6 +290,30 @@ struct ContentView: View {
                 .opacity(cameraManager.isLivePhotoEnabled ? 0.4 : 1)
             }
 
+            // 实况照片开关（仅照片模式且设备支持；与 RAW 互斥）
+            if cameraManager.currentMode == .photo && cameraManager.isLivePhotoSupported {
+                Button {
+                    cameraManager.toggleLivePhoto()
+                    haptic(.light)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "livephoto")
+                            .font(.system(size: 12))
+                        Text("实况")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .foregroundStyle(cameraManager.isLivePhotoEnabled ? .black : .white.opacity(0.85))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        cameraManager.isLivePhotoEnabled ? Color.yellow : Color.white.opacity(0.18),
+                        in: Capsule()
+                    )
+                }
+                .disabled(cameraManager.isRawEnabled)
+                .opacity(cameraManager.isRawEnabled ? 0.4 : 1)
+            }
+
             Spacer()
 
             // 视频录制指示
@@ -505,14 +529,8 @@ struct ContentView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 0) {
-            // 0. 实况照片切换（仅照片模式且设备支持时显示；RAW 在顶部栏）
-            if cameraManager.currentMode == .photo
-                && cameraManager.isLivePhotoSupported {
-                captureFormatBar
-                    .padding(.bottom, 10)
-            }
-
             // 1. 变焦预设按钮（1x / 2x / 5x）
+            // （RAW / 实况开关已统一移至顶部栏）
             zoomPresetBar
                 .padding(.bottom, 12)
 
@@ -534,36 +552,7 @@ struct ContentView: View {
         .padding(.horizontal, 0)
     }
 
-    // MARK: - 实况照片切换栏
-
-    /// 实况照片切换（仅照片模式；RAW 开关已移至顶部栏）
-    private var captureFormatBar: some View {
-        HStack(spacing: 28) {
-            if cameraManager.isLivePhotoSupported {
-                Button {
-                    cameraManager.toggleLivePhoto()
-                    haptic(.light)
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "livephoto")
-                            .font(.system(size: 14))
-                        Text("实况")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .foregroundStyle(cameraManager.isLivePhotoEnabled ? .black : .white.opacity(0.85))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        cameraManager.isLivePhotoEnabled ? Color.yellow : Color.white.opacity(0.18),
-                        in: Capsule()
-                    )
-                }
-                .disabled(cameraManager.isRawEnabled)
-                .opacity(cameraManager.isRawEnabled ? 0.4 : 1)
-            }
-        }
-        .animation(.easeInOut(duration: 0.15), value: cameraManager.isLivePhotoEnabled)
-    }
+    // MARK: - 实况照片 LIVE 标识
 
     /// 实况照片开启时的顶部 LIVE 标识（对齐原相机风格：黄色圆点 + LIVE 文字）
     private var livePhotoBadge: some View {

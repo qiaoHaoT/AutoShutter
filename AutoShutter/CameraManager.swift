@@ -98,6 +98,10 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var locationStatus: LocationStatus = .unknown
     /// 实况照片（Live Photo）是否开启
     @Published var isLivePhotoEnabled = false
+    /// 是否支持实况照片（会话配置完成后刷新。
+    /// 不能用计算属性：photoOutput 加入 session 前该值为 false，而计算属性
+    /// 变化不会触发 SwiftUI 重新渲染，导致开关按钮永远不出现）
+    @Published var isLivePhotoSupported = false
     /// Apple ProRAW 是否开启
     @Published var isRawEnabled = false
 
@@ -151,8 +155,6 @@ final class CameraManager: NSObject, ObservableObject,
         min(currentCamera?.maxAvailableVideoZoomFactor ?? 10.0, 15.0)
     }
 
-    /// 是否支持实况照片
-    var isLivePhotoSupported: Bool { photoOutput.isLivePhotoCaptureSupported }
     /// 是否支持 Apple ProRAW
     var isRawSupported: Bool { photoOutput.isAppleProRAWSupported }
 
@@ -327,6 +329,8 @@ final class CameraManager: NSObject, ObservableObject,
                 self.configureDeviceDefaults()
                 self.session.startRunning()
                 self.isSessionRunning = self.session.isRunning
+                // 会话启动后实况支持状态才可靠，刷新以驱动 UI 显示开关
+                self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
                 // 调试：打印实际使用的设备信息
                 print("[Camera] 使用设备: \(camera.deviceType.rawValue), " +
                       "镜头: \(camera.localizedName), " +
@@ -366,6 +370,10 @@ final class CameraManager: NSObject, ObservableObject,
                 self.session.sessionPreset = .high
             }
             self.session.commitConfiguration()
+            // 切换 preset 后实况支持状态可能变化，刷新
+            Task { @MainActor in
+                self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
+            }
         }
     }
 
@@ -396,6 +404,8 @@ final class CameraManager: NSObject, ObservableObject,
                     Task { @MainActor in
                         self.videoInput = newInput
                         self.currentCamera = newCamera
+                        // 前后摄像头实况支持状态可能不同，刷新
+                        self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
                         // 前置摄像头无闪光灯，自动切换为关闭
                         self.isUsingFrontCamera.toggle()
                         if self.isUsingFrontCamera {
@@ -573,6 +583,8 @@ final class CameraManager: NSObject, ObservableObject,
                     Task { @MainActor in
                         self.videoInput = newInput
                         self.currentCamera = newCamera
+                        // 换镜头后实况支持状态可能变化，刷新
+                        self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
                         let target = self.pendingZoom ?? zoom
                         self.pendingZoom = nil
                         self.isSwitchingLens = false
