@@ -335,7 +335,6 @@ final class CameraManager: NSObject, ObservableObject,
                 self.isSessionRunning = self.session.isRunning
                 // 会话启动后实况支持状态才可靠，刷新以驱动 UI 显示开关
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
-                CrashReporter.trace("configureSession 完成 rawOn=\(rawOn) liveSupported=\(self.isLivePhotoSupported) rawSupported=\(self.photoOutput.isAppleProRAWSupported)")
                 // startRunning() 是异步的，刚返回时 isLivePhotoCaptureSupported
                 // 可能仍为 false。ProRAW 关闭时需要轮询等待管线释放后支持恢复。
                 if !rawOn {
@@ -408,7 +407,6 @@ final class CameraManager: NSObject, ObservableObject,
             }
             Task { @MainActor in
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
-                CrashReporter.trace("setMode=\(mode.rawValue) liveSupported=\(self.isLivePhotoSupported)")
             }
         }
     }
@@ -727,10 +725,8 @@ final class CameraManager: NSObject, ObservableObject,
                 self.isLivePhotoSupported = supported
                 if enabled {
                     self.isLivePhotoEnabled = true
-                    CrashReporter.trace("实况已开启 (attempt=\(attempt)) liveSupported=true")
                 } else {
                     self.errorMessage = "实况管线启用失败。"
-                    CrashReporter.trace("实况 enable 失败 (attempt=\(attempt))")
                 }
             }
             return
@@ -744,7 +740,6 @@ final class CameraManager: NSObject, ObservableObject,
             Task { @MainActor in
                 self.isLivePhotoSupported = false
                 self.errorMessage = "此设备不支持实况照片。（ProRAW 管线释放超时）"
-                CrashReporter.trace("实况开启失败 (10次重试后) liveSupported=false proRAWEnabled=\(self.photoOutput.isAppleProRAWEnabled)")
             }
         }
     }
@@ -774,7 +769,6 @@ final class CameraManager: NSObject, ObservableObject,
             } else {
                 Task { @MainActor in
                     self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
-                    CrashReporter.trace("toggleRaw raw=\(rawOn) ProRAW=\(self.photoOutput.isAppleProRAWEnabled) liveSupported=\(self.isLivePhotoSupported)")
                 }
             }
         }
@@ -786,7 +780,6 @@ final class CameraManager: NSObject, ObservableObject,
         if supported {
             Task { @MainActor in
                 self.isLivePhotoSupported = true
-                CrashReporter.trace("实况支持恢复 (attempt=\(attempt))")
             }
             return
         }
@@ -797,7 +790,6 @@ final class CameraManager: NSObject, ObservableObject,
         } else {
             Task { @MainActor in
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
-                CrashReporter.trace("实况支持未恢复 (10次重试) proRAWEnabled=\(self.photoOutput.isAppleProRAWEnabled)")
             }
         }
     }
@@ -813,13 +805,11 @@ final class CameraManager: NSObject, ObservableObject,
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
-        CrashReporter.trace("capturePhoto 开始 raw=\(isRawEnabled) live=\(isLivePhotoEnabled) flash=\(flash.title) front=\(isUsingFrontCamera)")
 
         // session 重新配置（切换镜头/模式）后 isAppleProRAWEnabled 可能被重置，
         // 拍照前确保启用，否则 preferredRawPixelFormatType() 拿不到 ProRAW 格式
         if isRawEnabled, photoOutput.isAppleProRAWSupported, !photoOutput.isAppleProRAWEnabled {
             photoOutput.isAppleProRAWEnabled = true
-            CrashReporter.trace("重新启用 isAppleProRAWEnabled（session 重配置后被重置）")
         }
 
         let settings: AVCapturePhotoSettings
@@ -830,7 +820,6 @@ final class CameraManager: NSObject, ObservableObject,
                 ? [AVVideoCodecKey: AVVideoCodecType.hevc]
                 : nil
             settings = AVCapturePhotoSettings(rawPixelFormatType: rawType, processedFormat: processedFormat)
-            CrashReporter.trace("RAW settings 构建完成 rawType=\(rawType) processedFormat=\(processedFormat == nil ? "nil" : "hevc") proRAWEnabled=\(photoOutput.isAppleProRAWEnabled)")
             // 标记本次为 RAW 拍摄：委托会回调两次（DNG + 处理图），只保存 DNG
             rawShotIDs.insert(settings.uniqueID)
         } else if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
@@ -887,17 +876,13 @@ final class CameraManager: NSObject, ObservableObject,
             settings.livePhotoMovieFileURL = movieURL
             liveShotIDs.insert(settings.uniqueID)
         }
-        CrashReporter.trace("准备 capturePhoto flashMode=\(settings.flashMode.rawValue) quality=\(settings.photoQualityPrioritization.rawValue) hiRes=\(settings.isHighResolutionPhotoEnabled)")
         // 创建 AVCapturePhotoSettings 可能触发 pipeline 重配置，导致 isAppleProRAWEnabled
         // 被重置为 false。在调用 capturePhoto 前最终确保启用，否则 RAW 拍摄可能
         // 退回 Bayer RAW 格式（rawType 不同），且 fileDataRepresentation 行为异常。
         if isRawEnabled, photoOutput.isAppleProRAWSupported, !photoOutput.isAppleProRAWEnabled {
             photoOutput.isAppleProRAWEnabled = true
-            CrashReporter.trace("capturePhoto 前重新启用 isAppleProRAWEnabled")
         }
-        CrashReporter.trace("capturePhoto 调用前 proRAWEnabled=\(photoOutput.isAppleProRAWEnabled)")
         photoOutput.capturePhoto(with: settings, delegate: self)
-        CrashReporter.trace("capturePhoto 已调用（未同步崩溃）")
     }
 
     // MARK: - 视频录制
@@ -1155,24 +1140,18 @@ final class CameraManager: NSObject, ObservableObject,
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
                                  didFinishProcessingPhoto photo: AVCapturePhoto,
                                  error: Error?) {
-        CrashReporter.trace("委托回调 didFinishProcessingPhoto isRaw=\(photo.isRawPhoto) err=\(error?.localizedDescription ?? "nil")")
-        // 精确定位崩溃点：在 fileDataRepresentation() 前后各加打点
-        CrashReporter.trace("准备调用 fileDataRepresentation()")
         guard error == nil else {
-            CrashReporter.trace("guard 拦截：有错误，跳过保存")
             Task { @MainActor in
                 self.errorMessage = "拍照失败：\(error?.localizedDescription ?? "未知错误")"
             }
             return
         }
         guard let fileData = photo.fileDataRepresentation() else {
-            CrashReporter.trace("guard 拦截：fileDataRepresentation 返回 nil")
             Task { @MainActor in
                 self.errorMessage = "拍照失败：照片数据为空"
             }
             return
         }
-        CrashReporter.trace("fileDataRepresentation 成功 size=\(fileData.count)")
         let uniqueID = photo.resolvedSettings.uniqueID
         // fileDataRepresentation() 对 RAW 照片返回 DNG，对处理图返回 HEIF/JPEG
         let isRaw = photo.isRawPhoto
@@ -1180,17 +1159,14 @@ final class CameraManager: NSObject, ObservableObject,
         let thumbnail = isRaw ? nil : UIImage(data: fileData)
 
         Task { @MainActor in
-            CrashReporter.trace("保存Task开始 isRaw=\(isRaw) uid=\(uniqueID) inRawIDs=\(self.rawShotIDs.contains(uniqueID))")
             if isRaw {
                 // Apple ProRAW：保存 DNG，不注入 GPS（DNG 注入风险高）
                 // 不在此移除 rawShotIDs——等伴随处理图回调时再移除（去重）
                 self.captureCount += 1
-                CrashReporter.trace("保存DNG size=\(fileData.count)")
                 self.saveToPhotosLibrary(data: fileData)
             } else if self.rawShotIDs.contains(uniqueID) {
                 // ProRAW 的伴随处理图：不保存，移除标记
                 self.rawShotIDs.remove(uniqueID)
-                CrashReporter.trace("伴随处理图跳过保存")
             } else if self.liveShotIDs.contains(uniqueID) {
                 // 实况照片：缓存静态数据（注入 GPS），等视频回调后配对保存
                 self.captureCount += 1
@@ -1198,16 +1174,13 @@ final class CameraManager: NSObject, ObservableObject,
                 self.tryFlushLivePhoto(uniqueID: uniqueID)
             } else {
                 self.captureCount += 1
-                CrashReporter.trace("保存普通照片 size=\(fileData.count)")
                 self.saveToPhotosLibrary(data: self.photoDataInjectingGPS(fileData))
             }
             if let thumbnail {
-                CrashReporter.trace("更新缩略图")
                 self.onPhotoCaptured?(thumbnail)
             }
             // 轻触反馈：自动拍照时也能感知已拍摄
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            CrashReporter.trace("保存Task完成")
         }
     }
 

@@ -48,9 +48,6 @@ struct ContentView: View {
     @State private var showGrid = false
     @StateObject private var levelMonitor = LevelMonitor()
 
-    // 崩溃日志（上次运行崩溃时弹出，便于无 Xcode 时定位）
-    @State private var crashReportText: String?
-
     // 实况照片 LIVE 标识圆点呼吸动画
     @State private var livePulse = false
 
@@ -137,10 +134,6 @@ struct ContentView: View {
             .onAppear {
                 cameraManager.requestPermissionAndConfigure()
                 levelMonitor.start()
-                // 上次运行若崩溃，弹出诊断报告（异常堆栈 + 打点末尾）
-                if let report = CrashReporter.diagnosticReport() {
-                    crashReportText = report
-                }
             }
             .onDisappear {
                 levelMonitor.stop()
@@ -152,37 +145,6 @@ struct ContentView: View {
                 Button("好的") { cameraManager.errorMessage = nil }
             } message: {
                 Text(cameraManager.errorMessage ?? "")
-            }
-            .sheet(isPresented: Binding(
-                get: { crashReportText != nil },
-                set: { if !$0 { crashReportText = nil } }
-            )) {
-                if let report = crashReportText {
-                    NavigationStack {
-                        ScrollView {
-                            Text(report)
-                                .font(.system(.caption, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding()
-                                .textSelection(.enabled)
-                        }
-                        .navigationTitle("上次崩溃日志")
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button("复制全部") {
-                                    UIPasteboard.general.string = report
-                                }
-                            }
-                            ToolbarItem(placement: .topBarLeading) {
-                                Button("关闭") {
-                                    CrashReporter.clearCrashReport()
-                                    crashReportText = nil
-                                }
-                            }
-                        }
-                    }
-                }
             }
             .statusBarHidden(true)
             .preferredColorScheme(.dark)
@@ -299,19 +261,15 @@ struct ContentView: View {
                     cameraManager.toggleLivePhoto()
                     haptic(.light)
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "livephoto")
-                            .font(.system(size: 12))
-                        Text("实况")
-                            .font(.system(size: 12, weight: .bold))
-                    }
-                    .foregroundStyle(cameraManager.isLivePhotoEnabled ? .black : .white.opacity(0.85))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        cameraManager.isLivePhotoEnabled ? Color.yellow : Color.white.opacity(0.18),
-                        in: Capsule()
-                    )
+                    Image(systemName: "livephoto")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(cameraManager.isLivePhotoEnabled ? .black : .white.opacity(0.85))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            cameraManager.isLivePhotoEnabled ? Color.yellow : Color.white.opacity(0.18),
+                            in: Capsule()
+                        )
                 }
                 .disabled(cameraManager.isRawEnabled)
                 .opacity(cameraManager.isRawEnabled ? 0.4 : 1)
