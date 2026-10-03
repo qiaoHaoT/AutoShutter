@@ -331,6 +331,7 @@ final class CameraManager: NSObject, ObservableObject,
                 self.isSessionRunning = self.session.isRunning
                 // 会话启动后实况支持状态才可靠，刷新以驱动 UI 显示开关
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
+                CrashReporter.trace("configureSession 完成 liveSupported=\(self.isLivePhotoSupported) rawSupported=\(self.photoOutput.isAppleProRAWSupported)")
                 // 调试：打印实际使用的设备信息
                 print("[Camera] 使用设备: \(camera.deviceType.rawValue), " +
                       "镜头: \(camera.localizedName), " +
