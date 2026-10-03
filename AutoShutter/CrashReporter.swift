@@ -6,36 +6,43 @@ import Foundation
 ///   `NSInvalidArgumentException` 会被捕获，异常名/原因/堆栈写入 crash.log，
 ///   下次启动 `diagnosticReport()` 读取并弹出。
 /// - `trace(_:)` 在拍照关键路径打点，同步落盘；崩溃后末尾几行能定位崩在哪步之后。
+///
+/// 注：`NSSetUncaughtExceptionHandler` 需要 `@convention(c)` 函数指针，不能捕获
+/// 上下文，故 crashLogURL / traceLogURL / timeFormatter 提到文件级全局常量，
+/// 异常处理闭包内只引用全局符号，不构成捕获。
+
+// 文件级全局常量——@convention(c) 闭包可安全引用，不构成上下文捕获
+private let documentsURL = FileManager.default
+    .urls(for: .documentDirectory, in: .userDomainMask)[0]
+private let crashLogURL = documentsURL.appendingPathComponent("crash.log")
+private let traceLogURL = documentsURL.appendingPathComponent("trace.log")
+private let timeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f
+}()
+
+/// 顶层异常处理函数——不捕获任何上下文，可安全转为 @convention(c) 函数指针。
+/// 只引用文件级全局常量（crashLogURL），不构成捕获。
+private func uncaughtExceptionHandler(_ exception: NSException) {
+    let report = """
+    ===== 未捕获异常 =====
+    时间: \(Date())
+
+    异常: \(exception.name.rawValue)
+    原因: \(exception.reason ?? "(无)")
+
+    堆栈:
+    \(exception.callStackSymbols.joined(separator: "\n"))
+    """
+    try? report.write(to: crashLogURL, atomically: true, encoding: .utf8)
+}
+
 enum CrashReporter {
-
-    private static let documents = FileManager.default
-        .urls(for: .documentDirectory, in: .userDomainMask)[0]
-    /// 未捕获 NSException 堆栈（崩溃后留存，下次启动读取）
-    static let crashLogURL = documents.appendingPathComponent("crash.log")
-    /// 拍照流程打点日志
-    static let traceLogURL = documents.appendingPathComponent("trace.log")
-
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss.SSS"
-        return f
-    }()
 
     /// 安装未捕获异常处理器：崩溃时把异常名/原因/堆栈写入 crash.log
     static func install() {
-        NSSetUncaughtExceptionHandler { exception in
-            let report = """
-            ===== 未捕获异常 =====
-            时间: \(Date())
-
-            异常: \(exception.name.rawValue)
-            原因: \(exception.reason ?? "(无)")
-
-            堆栈:
-            \(exception.callStackSymbols.joined(separator: "\n"))
-            """
-            try? report.write(to: crashLogURL, atomically: true, encoding: .utf8)
-        }
+        NSSetUncaughtExceptionHandler(uncaughtExceptionHandler)
         // trace.log 超过 1MB 则清空，避免无限增长
         if let attrs = try? FileManager.default.attributesOfItem(atPath: traceLogURL.path),
            let size = attrs[.size] as? Int, size > 1_000_000 {
