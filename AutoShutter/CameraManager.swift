@@ -270,6 +270,7 @@ final class CameraManager: NSObject, ObservableObject,
     private func configureSession() {
         // 在主线程（MainActor）读取状态，避免 Sendable 闭包直接访问隔离属性
         let targetZoom = max(currentZoom, 1.0)
+        let rawOn = isRawEnabled
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.session.beginConfiguration()
@@ -306,11 +307,13 @@ final class CameraManager: NSObject, ObservableObject,
                 if self.photoOutput.isLivePhotoCaptureSupported {
                     self.photoOutput.isLivePhotoCaptureEnabled = true
                 }
-                // Apple ProRAW：会话配置时即启用。该开关仅「允许」输出 RAW，不改变普通拍照；
-                // 必须在 capturePhoto 前启用，否则带 rawPixelFormatType 的拍摄设置会触发
-                // NSInvalidArgumentException 闪退。运行中切换会重配置 pipeline，故一次性常开。
+                // Apple ProRAW：**按需启用，不能常开**。ProRAW 与实况照片在
+                // AVCapturePhotoOutput 层互斥——ProRAW 启用后
+                // isLivePhotoCaptureSupported 会变 false，实况开关就废了。
+                // 因此跟随 RAW 开关状态设置；关闭时实况恢复可用。
+                // （capturePhoto 内另有兜底：RAW 拍照前若被重置会重新启用）
                 if self.photoOutput.isAppleProRAWSupported {
-                    self.photoOutput.isAppleProRAWEnabled = true
+                    self.photoOutput.isAppleProRAWEnabled = rawOn
                 }
             }
 
@@ -371,6 +374,9 @@ final class CameraManager: NSObject, ObservableObject,
     /// 切换相机模式（照片 / 视频）
     func setMode(_ mode: CameraMode) {
         currentMode = mode
+        // 在主线程捕获当前开关状态，供 sessionQueue 闭包恢复管线
+        let rawOn = isRawEnabled
+        let liveOn = isLivePhotoEnabled
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.session.beginConfiguration()
@@ -380,6 +386,16 @@ final class CameraManager: NSObject, ObservableObject,
                 self.session.sessionPreset = .high
             }
             self.session.commitConfiguration()
+            // preset 切换会重置 photoOutput 管线状态，按当前开关恢复
+            // （ProRAW 与实况互斥，顺序：先 ProRAW，再实况）
+            if mode == .photo {
+                if self.photoOutput.isAppleProRAWSupported {
+                    self.photoOutput.isAppleProRAWEnabled = rawOn
+                }
+                if !rawOn, liveOn, self.photoOutput.isLivePhotoCaptureSupported {
+                    self.photoOutput.isLivePhotoCaptureEnabled = true
+                }
+            }
             // 切换 preset 后实况支持状态可能变化，刷新
             Task { @MainActor in
                 self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
@@ -666,21 +682,67 @@ final class CameraManager: NSObject, ObservableObject,
     }
 
     /// 切换实况照片开关
+    /// ProRAW 与实况在 AVCapturePhotoOutput 层互斥：开启实况前必须先把
+    /// isAppleProRAWEnabled 关掉，否则 isLivePhotoCaptureSupported 一直是 false。
     func toggleLivePhoto() {
-        guard photoOutput.isLivePhotoCaptureSupported else {
-            errorMessage = "此设备不支持实况照片。"
+        // 关闭实况：直接翻状态即可，无需动管线
+        if isLivePhotoEnabled {
+            isLivePhotoEnabled = false
             return
         }
-        isLivePhotoEnabled.toggle()
+        // 开启实况：RAW 与实况互斥，先关 RAW
+        isRawEnabled = false
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.session.beginConfiguration()
+            // 关闭 ProRAW，恢复实况管线
+            if self.photoOutput.isAppleProRAWSupported {
+                self.photoOutput.isAppleProRAWEnabled = false
+            }
+            if self.photoOutput.isLivePhotoCaptureSupported {
+                self.photoOutput.isLivePhotoCaptureEnabled = true
+            }
+            self.session.commitConfiguration()
+            // 在 sessionQueue 上读取管线切换后的真实支持状态，再回主线程
+            let supported = self.photoOutput.isLivePhotoCaptureSupported
+            let enabled = self.photoOutput.isLivePhotoCaptureEnabled
+            Task { @MainActor in
+                self.isLivePhotoSupported = supported
+                if supported, enabled {
+                    self.isLivePhotoEnabled = true
+                    CrashReporter.trace("实况已开启 liveSupported=true liveEnabled=true")
+                } else {
+                    self.errorMessage = "此设备不支持实况照片。"
+                    CrashReporter.trace("实况开启失败 liveSupported=\(supported) liveEnabled=\(enabled)")
+                }
+            }
+        }
     }
 
     /// 切换 Apple ProRAW 开关
+    /// ProRAW 与实况在 AVCapturePhotoOutput 层互斥：开启 RAW 时需同步
+    /// 关闭实况并启用 ProRAW 管线；关闭时恢复实况可用。
     func toggleRaw() {
         guard photoOutput.isAppleProRAWSupported else {
             errorMessage = "此设备不支持 Apple ProRAW。"
             return
         }
         isRawEnabled.toggle()
+        // RAW 与实况互斥：开 RAW 时强制关实况
+        if isRawEnabled {
+            isLivePhotoEnabled = false
+        }
+        let rawOn = isRawEnabled
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.session.beginConfiguration()
+            self.photoOutput.isAppleProRAWEnabled = rawOn
+            self.session.commitConfiguration()
+            Task { @MainActor in
+                self.isLivePhotoSupported = self.photoOutput.isLivePhotoCaptureSupported
+                CrashReporter.trace("toggleRaw raw=\(rawOn) ProRAW=\(self.photoOutput.isAppleProRAWEnabled) liveSupported=\(self.isLivePhotoSupported)")
+            }
+        }
     }
 
     // MARK: - 拍照
