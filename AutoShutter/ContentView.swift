@@ -121,16 +121,17 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
-                    .overlay(alignment: .top) {
-                        if cameraManager.isLivePhotoEnabled {
-                            livePhotoBadge
-                                .padding(.top, 8)
-                        }
-                    }
 
                     // 4. 底部控制区
                     bottomControls
                         .padding(.bottom, geometry.safeAreaInsets.bottom > 0 ? 8 : 20)
+                }
+                // 实况照片 LIVE 标识：浮于屏幕最顶部中央（对齐原相机风格）
+                .overlay(alignment: .top) {
+                    if cameraManager.isLivePhotoEnabled {
+                        livePhotoBadge
+                            .padding(.top, 8)
+                    }
                 }
             }
             .onAppear {

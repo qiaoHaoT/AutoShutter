@@ -747,6 +747,14 @@ final class CameraManager: NSObject, ObservableObject,
             liveShotIDs.insert(settings.uniqueID)
         }
         CrashReporter.trace("准备 capturePhoto flashMode=\(settings.flashMode.rawValue) quality=\(settings.photoQualityPrioritization.rawValue) hiRes=\(settings.isHighResolutionPhotoEnabled)")
+        // 创建 AVCapturePhotoSettings 可能触发 pipeline 重配置，导致 isAppleProRAWEnabled
+        // 被重置为 false。在调用 capturePhoto 前最终确保启用，否则 RAW 拍摄可能
+        // 退回 Bayer RAW 格式（rawType 不同），且 fileDataRepresentation 行为异常。
+        if isRawEnabled, photoOutput.isAppleProRAWSupported, !photoOutput.isAppleProRAWEnabled {
+            photoOutput.isAppleProRAWEnabled = true
+            CrashReporter.trace("capturePhoto 前重新启用 isAppleProRAWEnabled")
+        }
+        CrashReporter.trace("capturePhoto 调用前 proRAWEnabled=\(photoOutput.isAppleProRAWEnabled)")
         photoOutput.capturePhoto(with: settings, delegate: self)
         CrashReporter.trace("capturePhoto 已调用（未同步崩溃）")
     }
@@ -1007,12 +1015,23 @@ final class CameraManager: NSObject, ObservableObject,
                                  didFinishProcessingPhoto photo: AVCapturePhoto,
                                  error: Error?) {
         CrashReporter.trace("委托回调 didFinishProcessingPhoto isRaw=\(photo.isRawPhoto) err=\(error?.localizedDescription ?? "nil")")
-        guard error == nil, let fileData = photo.fileDataRepresentation() else {
+        // 精确定位崩溃点：在 fileDataRepresentation() 前后各加打点
+        CrashReporter.trace("准备调用 fileDataRepresentation()")
+        guard error == nil else {
+            CrashReporter.trace("guard 拦截：有错误，跳过保存")
             Task { @MainActor in
                 self.errorMessage = "拍照失败：\(error?.localizedDescription ?? "未知错误")"
             }
             return
         }
+        guard let fileData = photo.fileDataRepresentation() else {
+            CrashReporter.trace("guard 拦截：fileDataRepresentation 返回 nil")
+            Task { @MainActor in
+                self.errorMessage = "拍照失败：照片数据为空"
+            }
+            return
+        }
+        CrashReporter.trace("fileDataRepresentation 成功 size=\(fileData.count)")
         let uniqueID = photo.resolvedSettings.uniqueID
         // fileDataRepresentation() 对 RAW 照片返回 DNG，对处理图返回 HEIF/JPEG
         let isRaw = photo.isRawPhoto
