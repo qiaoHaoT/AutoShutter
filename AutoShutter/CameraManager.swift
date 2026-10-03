@@ -672,6 +672,7 @@ final class CameraManager: NSObject, ObservableObject,
     /// 执行一次拍照
     func capturePhoto() {
         guard session.isRunning else { return }
+        CrashReporter.trace("capturePhoto 开始 raw=\(isRawEnabled) live=\(isLivePhotoEnabled) flash=\(flash.title) front=\(isUsingFrontCamera)")
 
         let settings: AVCapturePhotoSettings
         // Apple ProRAW（raw + HEIF 预览），优先于实况
@@ -681,6 +682,7 @@ final class CameraManager: NSObject, ObservableObject,
                 ? [AVVideoCodecKey: AVVideoCodecType.hevc]
                 : nil
             settings = AVCapturePhotoSettings(rawPixelFormatType: rawType, processedFormat: processedFormat)
+            CrashReporter.trace("RAW settings 构建完成 rawType=\(rawType) processedFormat=\(processedFormat == nil ? "nil" : "hevc") proRAWEnabled=\(photoOutput.isAppleProRAWEnabled)")
             // 标记本次为 RAW 拍摄：委托会回调两次（DNG + 处理图），只保存 DNG
             rawShotIDs.insert(settings.uniqueID)
         } else if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
@@ -688,10 +690,15 @@ final class CameraManager: NSObject, ObservableObject,
         } else {
             settings = AVCapturePhotoSettings()
         }
-        settings.isHighResolutionPhotoEnabled = true
-        // 最高画质优先：触发系统多帧合成与更深的图像处理管线
-        if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.quality.rawValue {
-            settings.photoQualityPrioritization = .quality
+        // 高分辨率与画质优先仅对非 RAW 拍照启用：
+        // ProRAW 自带多帧合成，叠加 photoQualityPrioritization=.quality 或
+        // 已废弃的 isHighResolutionPhotoEnabled 会在 capturePhoto 验证阶段
+        // 触发 NSInvalidArgumentException 闪退（Apple 官方 ProRAW 示例均不设这两项）。
+        if !isRawEnabled {
+            settings.isHighResolutionPhotoEnabled = true
+            if photoOutput.maxPhotoQualityPrioritization.rawValue >= AVCapturePhotoOutput.QualityPrioritization.quality.rawValue {
+                settings.photoQualityPrioritization = .quality
+            }
         }
         // 静音时抑制系统内置快门音效（iOS 18+ 官方 API）。
         // 拍照时系统会自动播放快门声（隐私政策），此开关将其关闭；
@@ -700,8 +707,9 @@ final class CameraManager: NSObject, ObservableObject,
         if isMuted, #available(iOS 18.0, *), photoOutput.isShutterSoundSuppressionSupported {
             settings.isShutterSoundSuppressionEnabled = true
         }
-        // 闪光灯（前置摄像头无闪光灯）
-        if isUsingFrontCamera {
+        // 闪光灯（前置摄像头无闪光灯；RAW 拍摄强制关闭——ProRAW 与闪光混用
+        // 在部分设备上会令 capturePhoto 抛 NSInvalidArgumentException 闪退）
+        if isUsingFrontCamera || isRawEnabled {
             settings.flashMode = .off
         } else {
             switch flash {
@@ -731,7 +739,9 @@ final class CameraManager: NSObject, ObservableObject,
             settings.livePhotoMovieFileURL = movieURL
             liveShotIDs.insert(settings.uniqueID)
         }
+        CrashReporter.trace("准备 capturePhoto flashMode=\(settings.flashMode.rawValue) quality=\(settings.photoQualityPrioritization.rawValue) hiRes=\(settings.isHighResolutionPhotoEnabled)")
         photoOutput.capturePhoto(with: settings, delegate: self)
+        CrashReporter.trace("capturePhoto 已调用（未同步崩溃）")
     }
 
     // MARK: - 视频录制
@@ -989,6 +999,7 @@ final class CameraManager: NSObject, ObservableObject,
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
                                  didFinishProcessingPhoto photo: AVCapturePhoto,
                                  error: Error?) {
+        CrashReporter.trace("委托回调 didFinishProcessingPhoto isRaw=\(photo.isRawPhoto) err=\(error?.localizedDescription ?? "nil")")
         guard error == nil, let fileData = photo.fileDataRepresentation() else {
             Task { @MainActor in
                 self.errorMessage = "拍照失败：\(error?.localizedDescription ?? "未知错误")"

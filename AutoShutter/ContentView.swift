@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import CoreMotion
+import UIKit
 
 // MARK: - 主界面
 
@@ -46,6 +47,9 @@ struct ContentView: View {
     // 网格线 / 水平仪
     @State private var showGrid = false
     @StateObject private var levelMonitor = LevelMonitor()
+
+    // 崩溃日志（上次运行崩溃时弹出，便于无 Xcode 时定位）
+    @State private var crashReportText: String?
 
     var body: some View {
         GeometryReader { geometry in
@@ -123,6 +127,10 @@ struct ContentView: View {
             .onAppear {
                 cameraManager.requestPermissionAndConfigure()
                 levelMonitor.start()
+                // 上次运行若崩溃，弹出诊断报告（异常堆栈 + 打点末尾）
+                if let report = CrashReporter.diagnosticReport() {
+                    crashReportText = report
+                }
             }
             .onDisappear {
                 levelMonitor.stop()
@@ -134,6 +142,37 @@ struct ContentView: View {
                 Button("好的") { cameraManager.errorMessage = nil }
             } message: {
                 Text(cameraManager.errorMessage ?? "")
+            }
+            .sheet(isPresented: Binding(
+                get: { crashReportText != nil },
+                set: { if !$0 { crashReportText = nil } }
+            )) {
+                if let report = crashReportText {
+                    NavigationStack {
+                        ScrollView {
+                            Text(report)
+                                .font(.system(.caption, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding()
+                                .textSelection(.enabled)
+                        }
+                        .navigationTitle("上次崩溃日志")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("复制全部") {
+                                    UIPasteboard.general.string = report
+                                }
+                            }
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button("关闭") {
+                                    CrashReporter.clearCrashReport()
+                                    crashReportText = nil
+                                }
+                            }
+                        }
+                    }
+                }
             }
             .statusBarHidden(true)
             .preferredColorScheme(.dark)
