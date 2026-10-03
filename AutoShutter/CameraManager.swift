@@ -674,6 +674,13 @@ final class CameraManager: NSObject, ObservableObject,
         guard session.isRunning else { return }
         CrashReporter.trace("capturePhoto 开始 raw=\(isRawEnabled) live=\(isLivePhotoEnabled) flash=\(flash.title) front=\(isUsingFrontCamera)")
 
+        // session 重新配置（切换镜头/模式）后 isAppleProRAWEnabled 可能被重置，
+        // 拍照前确保启用，否则 preferredRawPixelFormatType() 拿不到 ProRAW 格式
+        if isRawEnabled, photoOutput.isAppleProRAWSupported, !photoOutput.isAppleProRAWEnabled {
+            photoOutput.isAppleProRAWEnabled = true
+            CrashReporter.trace("重新启用 isAppleProRAWEnabled（session 重配置后被重置）")
+        }
+
         let settings: AVCapturePhotoSettings
         // Apple ProRAW（raw + HEIF 预览），优先于实况
         if isRawEnabled, photoOutput.isAppleProRAWSupported,
@@ -1013,14 +1020,17 @@ final class CameraManager: NSObject, ObservableObject,
         let thumbnail = isRaw ? nil : UIImage(data: fileData)
 
         Task { @MainActor in
+            CrashReporter.trace("保存Task开始 isRaw=\(isRaw) uid=\(uniqueID) inRawIDs=\(self.rawShotIDs.contains(uniqueID))")
             if isRaw {
                 // Apple ProRAW：保存 DNG，不注入 GPS（DNG 注入风险高）
-                self.rawShotIDs.remove(uniqueID)
+                // 不在此移除 rawShotIDs——等伴随处理图回调时再移除（去重）
                 self.captureCount += 1
+                CrashReporter.trace("保存DNG size=\(fileData.count)")
                 self.saveToPhotosLibrary(data: fileData)
             } else if self.rawShotIDs.contains(uniqueID) {
-                // ProRAW 的伴随处理图：不保存，避免相册出现重复照片
+                // ProRAW 的伴随处理图：不保存，移除标记
                 self.rawShotIDs.remove(uniqueID)
+                CrashReporter.trace("伴随处理图跳过保存")
             } else if self.liveShotIDs.contains(uniqueID) {
                 // 实况照片：缓存静态数据（注入 GPS），等视频回调后配对保存
                 self.captureCount += 1
@@ -1028,13 +1038,16 @@ final class CameraManager: NSObject, ObservableObject,
                 self.tryFlushLivePhoto(uniqueID: uniqueID)
             } else {
                 self.captureCount += 1
+                CrashReporter.trace("保存普通照片 size=\(fileData.count)")
                 self.saveToPhotosLibrary(data: self.photoDataInjectingGPS(fileData))
             }
             if let thumbnail {
+                CrashReporter.trace("更新缩略图")
                 self.onPhotoCaptured?(thumbnail)
             }
             // 轻触反馈：自动拍照时也能感知已拍摄
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            CrashReporter.trace("保存Task完成")
         }
     }
 
